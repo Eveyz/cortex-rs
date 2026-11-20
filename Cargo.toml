@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cortex-kernels",
+    "crates/cortex-ssm",
+    "crates/cortex-hippocampus",
+    "crates/cortex-sleep",
+    "crates/cortex-runtime",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+authors = ["cortex-local contributors"]
+rust-version = "1.75"
+
+[profile.release]
+lto = false
+codegen-units = 1
+opt-level = 3

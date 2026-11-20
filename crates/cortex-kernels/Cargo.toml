@@ -1,0 +1,16 @@
+[package]
+name = "cortex-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust 1.58-bit tile GEMV kernels (scalar, AVX2, NEON). No C toolchain."
+publish = false
+
+[dependencies]
+
+[features]
+default = []
+# Optional row-group parallel GEMV. Default tests stay single-threaded.
+parallel = []

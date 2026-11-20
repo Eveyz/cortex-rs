@@ -1,0 +1,13 @@
+[package]
+name = "cortex-hippocampus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Online two-layer memory: analytic SiLU MLP, surprise gate, lock-free arena, WAL."
+publish = false
+
+[dependencies]
+cortex-kernels = { path = "../cortex-kernels" }
+memmap2 = "0.9"

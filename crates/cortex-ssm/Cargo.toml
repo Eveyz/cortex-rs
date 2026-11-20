@@ -1,0 +1,12 @@
+[package]
+name = "cortex-ssm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Gated DeltaNet, INT8 ring sliding attention, and BitSSM blocks."
+publish = false
+
+[dependencies]
+cortex-kernels = { path = "../cortex-kernels" }

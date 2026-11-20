@@ -1,0 +1,19 @@
+[package]
+name = "cortex-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "CortexModel, .ctxb loader, byte-fallback tokenizer, and cortex-cli."
+publish = false
+
+[dependencies]
+cortex-kernels = { path = "../cortex-kernels" }
+cortex-ssm = { path = "../cortex-ssm" }
+cortex-hippocampus = { path = "../cortex-hippocampus" }
+cortex-sleep = { path = "../cortex-sleep" }
+
+[[bin]]
+name = "cortex-cli"
+path = "src/main.rs"
