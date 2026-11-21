@@ -509,6 +509,11 @@ def self_check(model: Mini, rust_bin: Path, tokens: list[int]) -> None:
 
 
 def main() -> None:
+    if "--describe-preset" in sys.argv:
+        from presets import describe
+
+        describe(sys.argv)
+        return
     if "--step1" in sys.argv:
         sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--step1"]
         from step1_train import main as step1_main

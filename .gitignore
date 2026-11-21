@@ -1,5 +1,9 @@
 /target
 data/step1/corpus.txt
+data/step2/download_plan.txt
+data/step3/download_plan.txt
+data/step2/out/
+data/step3/out/
 data/step1/tokens.u32
 data/step1/sample_for_bpe.txt
 artifacts/

@@ -29,6 +29,9 @@ disagreed with that brief. There is no C toolchain and no autograd inside
 | `cortex-cli` `/status` `/sleep` `/reset-mem`, streaming generate | `main.rs`, `generate.rs` |
 | Local HTTP + Unix socket | `api.rs` |
 | QAT STE, joint hippocampus, `export_to_ctxb`, logit self-check | `tools/train_seed_qat.py` |
+| Step 1 measured 25.1M run | `tools/step1_train.py`, `docs/step1.md` |
+| Step 2/3 manifests and the three cleaners | `tools/prepare_corpus.py`, `configs/` |
+| Qwen3-28B distill scaffold (mock teacher by default) | `tools/distill_qwen.py` |
 
 ## Recurrence actually implemented
 

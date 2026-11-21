@@ -1,0 +1,36 @@
+{
+  "name": "step2_mix",
+  "step": 2,
+  "purpose": "Design rung for short QA, simple explanations, and small scripts. Not a measured training result.",
+  "total_bytes_design": 2000000000,
+  "token_budget_design": 500000000,
+  "token_budget_note": "Planning figure at about 4 bytes/token. Not counted on a real download.",
+  "hours_design": "8-12",
+  "hours_note": "Curriculum design budget, not a wall-clock measurement.",
+  "download": false,
+  "model_preset": "step2",
+  "model_note": "See python3 tools/train_seed_qat.py --describe-preset step2. Not trained.",
+  "components": [
+    {
+      "name": "bilingual_textbooks",
+      "weight": 0.55,
+      "bytes_design": 1100000000,
+      "sources": ["Cosmopedia v2", "FineWeb-Edu score>=4.2", "CCI3-HQ textbook subset"],
+      "license": "Apache-2.0 (Cosmopedia v2); ODC-By 1.0 (FineWeb-Edu); CCI3-HQ: read the BAAI card before use"
+    },
+    {
+      "name": "basic_python",
+      "weight": 0.3,
+      "bytes_design": 600000000,
+      "sources": ["StarCoder2-Edu / The Stack Python subset with docstrings"],
+      "license": "Per-file original licenses; BigCode / Software Heritage terms"
+    },
+    {
+      "name": "short_explanations",
+      "weight": 0.15,
+      "bytes_design": 300000000,
+      "sources": ["synthetic vernacular explainers (this repo's generator style)"],
+      "license": "Original synthetic text, no third-party claim"
+    }
+  ]
+}

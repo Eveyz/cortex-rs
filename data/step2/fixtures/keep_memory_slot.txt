@@ -1,0 +1,7 @@
+<memory_slot key="api.timeout" evidence="present">
+网关的时间预算是 30 秒，所以接口说明里的超时字段写成 30 秒。没有这条记录之前，不要猜一个别的数字。
+</memory_slot>
+
+<memory_slot key="api.timeout" evidence="absent">
+我没有查到这个字段的记录，不能编一个超时时间。
+</memory_slot>

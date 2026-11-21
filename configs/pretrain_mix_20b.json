@@ -1,0 +1,50 @@
+{
+  "name": "pretrain_mix_20b",
+  "step": 3,
+  "purpose": "Design recipe for a 1.6B seed. This file does not include the bytes.",
+  "total_tokens": 20000000000,
+  "total_bytes_design": 80000000000,
+  "download": false,
+  "components": [
+    {
+      "name": "bilingual_textbooks",
+      "weight": 0.35,
+      "tokens": 7000000000,
+      "bytes_design": 28000000000,
+      "sources": ["Cosmopedia v2", "FineWeb-Edu score>=4.2", "CCI3-HQ textbook subset", "rewritten explainer style"],
+      "license": "Apache-2.0 (Cosmopedia v2); ODC-By 1.0 (FineWeb-Edu); verify CCI3-HQ card"
+    },
+    {
+      "name": "code_traces",
+      "weight": 0.25,
+      "tokens": 5000000000,
+      "bytes_design": 20000000000,
+      "sources": ["StarCoder2-Edu", "Python/Rust/TypeScript with docstrings and passing tests"],
+      "license": "Per-file original licenses; BigCode dataset terms"
+    },
+    {
+      "name": "cot_self_correction",
+      "weight": 0.2,
+      "tokens": 4000000000,
+      "bytes_design": 16000000000,
+      "sources": ["OpenMathInstruct-2", "traces that contain backtracking language"],
+      "license": "CC-BY-4.0 (OpenMathInstruct-2, confirm the card)"
+    },
+    {
+      "name": "dialogue_vernacular",
+      "weight": 0.12,
+      "tokens": 2400000000,
+      "bytes_design": 9600000000,
+      "sources": ["synthetic vernacular dialogue"],
+      "license": "Original synthetic; no officialese"
+    },
+    {
+      "name": "memory_interface_honesty",
+      "weight": 0.08,
+      "tokens": 1600000000,
+      "bytes_design": 6400000000,
+      "sources": ["<memory_slot> QA", "refuse-when-no-evidence"],
+      "license": "Original synthetic"
+    }
+  ]
+}
