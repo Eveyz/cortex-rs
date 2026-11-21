@@ -74,6 +74,15 @@ Usage:
   python distill_generate.py --out distill-data.jsonl --categories math,code
   python distill_generate.py --teacher Qwen/Qwen3-32B --out data.jsonl
 
+  # Real HF problems as the question bank (teacher only answers them;
+  # the same verification gates apply). Needs: pip install datasets.
+  # Math defaults to teacher-invented problems; GSM8K is the real
+  # alternative. Code defaults to the 48 built-in tasks + invented
+  # ones; HumanEval (164) + MBPP (974) are the real alternatives.
+  # HF questions are used first; the remainder falls back to synthetic.
+  python distill_generate.py --out data.jsonl \
+      --math-source gsm8k --code-source humaneval+mbpp
+
 Output: JSONL, one record per line:
   {"category", "prompt", "response", "verified", "meta", "teacher"}
 The student trainer (distill_train.py) reads this file directly.
@@ -113,6 +122,89 @@ DEFAULT_COUNTS = {
     "tooluse": 2000,
 }
 CATEGORIES = list(DEFAULT_COUNTS)
+
+# ---------------------------------------------------------------------------
+# HF question banks (real problems; the teacher only answers them).
+# Populated by main() when --math-source / --code-source request them.
+# The generators use these FIRST and fall back to teacher-invented
+# questions for the remainder, so a small bank never caps the count.
+# Requires `pip install datasets` (lazy import -- the script still
+# runs without it as long as the HF sources are not requested).
+# ---------------------------------------------------------------------------
+
+HF_QUESTIONS: dict[str, list] = {}
+
+
+def _load_hf_dataset(name: str, config: str | None = None):
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise SystemExit(
+            "the 'datasets' package is required for the HF question "
+            "sources (--math-source gsm8k / --code-source humaneval, mbpp); "
+            "install it with: pip install datasets"
+        )
+    return load_dataset(name, config) if config else load_dataset(name)
+
+
+def load_gsm8k_questions(rng: random.Random) -> list[tuple[str, str, str]]:
+    """GSM8K train (7473 grade-school word problems). Returns
+    (question, expected_final_number, 'gsm8k'). The expected answer
+    is the number after '####' in the reference solution."""
+    ds = _load_hf_dataset("openai/gsm8k", "main")
+    out = []
+    for rec in ds["train"]:
+        m = re.search(r"####\s*(.+)", rec["answer"])
+        if not m:
+            continue
+        expected = m.group(1).strip().replace(",", "")
+        try:
+            float(expected)
+        except ValueError:
+            continue
+        out.append((rec["question"].strip(), expected, "gsm8k"))
+    rng.shuffle(out)
+    return out
+
+
+def load_humaneval_questions() -> list[tuple[str, str, str]]:
+    """HumanEval (164 problems). Returns (task, tests, 'humaneval')
+    where tests is a test file that imports the entry point from
+    solution.py, runs the dataset's check(), and prints
+    ALL TESTS PASSED (the same gate run_tests() applies)."""
+    ds = _load_hf_dataset("openai/openai_humaneval")
+    out = []
+    for rec in ds["test"]:
+        entry = rec["entry_point"]
+        tests = (
+            f"from solution import {entry}\n"
+            f"{rec['test']}\n"
+            f"check({entry})\n"
+            "print('ALL TESTS PASSED')\n"
+        )
+        out.append((rec["prompt"].strip(), tests, "humaneval"))
+    return out
+
+
+def load_mbpp_questions() -> list[tuple[str, str, str]]:
+    """MBPP train (974 problems). Returns (task, tests, 'mbpp').
+    The function name is taken from the reference solution's def
+    line; test_setup_code (if any) is included before the asserts."""
+    ds = _load_hf_dataset("google-research-datasets/mbpp")
+    out = []
+    for rec in ds["train"]:
+        m = re.search(r"def\s+(\w+)\s*\(", rec["code"])
+        if not m:
+            continue
+        name = m.group(1)
+        setup = (rec.get("test_setup_code") or "").strip()
+        body = "\n".join(rec["test_list"])
+        tests = f"from solution import {name}\n"
+        if setup:
+            tests += setup + "\n"
+        tests += body + "\nprint('ALL TESTS PASSED')\n"
+        out.append((rec["text"].strip(), tests, "mbpp"))
+    return out
 
 # ---------------------------------------------------------------------------
 # Seed data (small, real, hand-written -- the teacher expands from these)
@@ -311,8 +403,24 @@ def chat(llm, messages: list[dict], sampling, think: bool):
 
 def gen_math(llm, sampling, n: int, rng: random.Random):
     """CoT math. Seeds are verified against known answers; invented
-    problems are kept only when two independent solutions agree."""
+    problems are kept only when two independent solutions agree.
+    If --math-source gsm8k was given, real GSM8K problems are used
+    first (same exact-answer gate), then seeds, then invented ones."""
     made = 0
+    # 0) Real GSM8K problems (exact verification).
+    for problem, expected, source in HF_QUESTIONS.get("math", []):
+        if made >= n:
+            return
+        msgs = [
+            {"role": "system", "content": "你是一位耐心的小学数学老师。一步一步推导，最后给出答案。"},
+            {"role": "user", "content": f"请一步一步解答这道题，最后一个字给出答案：{problem}"},
+        ]
+        text = chat(llm, msgs, sampling, think=True)
+        got = extract_final_number(strip_think(text))
+        if answers_match(got, expected):
+            yield (f"请一步一步解答这道题，最后一个字给出答案：{problem}", text, True,
+                   {"source": source, "expected": expected})
+            made += 1
     # 1) Seed problems (exact verification).
     for problem, expected in MATH_SEEDS:
         if made >= n:
@@ -366,8 +474,33 @@ def gen_math(llm, sampling, n: int, rng: random.Random):
 def gen_code(llm, sampling, n: int, rng: random.Random):
     """Code + unit tests. The solution is executed; only passing
     solutions are kept. The response stored is solution + a short
-    explanation (the tests themselves are NOT in the response)."""
+    explanation (the tests themselves are NOT in the response).
+    If --code-source requested HumanEval / MBPP, those real problems
+    are used first (same execution gate), then the built-in tasks,
+    then teacher-invented ones."""
     made = 0
+    # 0) Real HF problems (HumanEval / MBPP), same execution gate.
+    hf_tasks = list(HF_QUESTIONS.get("code", []))
+    rng.shuffle(hf_tasks)
+    for task, tests, source in hf_tasks:
+        if made >= n:
+            return
+        msgs = [
+            {"role": "system", "content": "你是一位 Python 程序员。只输出代码，不要解释。"},
+            {"role": "user", "content": f"写出满足要求的 Python 代码，只给代码块：\n{task}"},
+        ]
+        text = chat(llm, msgs, sampling, think=False)
+        code = extract_code_block(text) or text
+        if run_tests(code, tests):
+            explain_msgs = [
+                {"role": "system", "content": "你是一位编程老师，用两三句话解释代码思路。"},
+                {"role": "user", "content": f"解释下面这段代码的思路：\n```python\n{code}\n```"},
+            ]
+            expl = strip_think(chat(llm, explain_msgs, sampling, think=False))
+            response = f"```python\n{code}\n```\n\n{expl}"
+            yield (f"写出满足要求的 Python 代码：\n{task}", response, True, {"source": source})
+            made += 1
+    # 1) Built-in tasks.
     tasks = list(CODE_TASKS)
     rng.shuffle(tasks)
     for task, tests in tasks:
@@ -1015,6 +1148,13 @@ def main(argv=None) -> int:
     ap.add_argument("--tp", type=int, default=1, help="tensor parallel size")
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--math-source", default="synthetic", choices=["synthetic", "gsm8k"],
+                    help="math questions: teacher-invented (synthetic) or real GSM8K "
+                    "problems first (then teacher-invented for the remainder)")
+    ap.add_argument("--code-source", default="synthetic",
+                    choices=["synthetic", "humaneval", "mbpp", "humaneval+mbpp"],
+                    help="code tasks: built-in + teacher-invented (synthetic), or real "
+                    "HumanEval / MBPP problems first (then built-in + invented)")
     args = ap.parse_args(argv)
 
     cats = CATEGORIES if args.categories == "all" else [c.strip() for c in args.categories.split(",")]
@@ -1031,6 +1171,23 @@ def main(argv=None) -> int:
     out_path = Path(args.out)
     existing, seen = load_existing(out_path)
     rng = random.Random(args.seed)
+
+    # HF question banks (loaded before the teacher starts; the
+    # generators consume them first, then fall back to synthetic).
+    if args.math_source == "gsm8k":
+        print("loading GSM8K train questions...", flush=True)
+        HF_QUESTIONS["math"] = load_gsm8k_questions(rng)
+        print(f"loaded {len(HF_QUESTIONS['math'])} GSM8K questions", flush=True)
+    if args.code_source != "synthetic":
+        parts = []
+        if "humaneval" in args.code_source:
+            print("loading HumanEval questions...", flush=True)
+            parts.extend(load_humaneval_questions())
+        if "mbpp" in args.code_source:
+            print("loading MBPP train questions...", flush=True)
+            parts.extend(load_mbpp_questions())
+        HF_QUESTIONS["code"] = parts
+        print(f"loaded {len(parts)} HF code questions", flush=True)
 
     # vLLM import is lazy so --help works without a GPU install.
     from vllm import LLM, SamplingParams
