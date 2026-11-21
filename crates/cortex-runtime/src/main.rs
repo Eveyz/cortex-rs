@@ -21,16 +21,18 @@ use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 
 use cortex_hippocampus::SnapshotStore;
+use cortex_kernels::{l2_normalize_inplace, quantize_activations_sym_i8, sigmoid, silu};
 use cortex_runtime::ctxb::{load_ctxb, save_ctxb};
 use cortex_runtime::expert::{
     list_packages, load_package, save_package, tiny_adapter, ExpertMeta, ExpertPackage, ROUTER_ABI,
 };
 use cortex_runtime::fsm::{FsmEvent, RuntimeFsm};
 use cortex_runtime::generate::{format_tick, next_token, rss_kb, Session};
-use cortex_runtime::model::{CortexConfig, CortexModel};
+use cortex_runtime::model::{CortexConfig, CortexModel, ModelState};
 use cortex_runtime::tokenizer::Tokenizer;
 use cortex_runtime::tools::{AgentLoop, ToolRegistry};
 use cortex_sleep::ReplayBuffer;
+use cortex_ssm::deltanet_step;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -55,6 +57,7 @@ fn main() -> ExitCode {
         "tools" => cmd_tools(),
         "repl" => cmd_repl(&args[1..]),
         "logits" => cmd_logits(&args[1..]),
+        "dump" => cmd_dump(&args[1..]),
         "status" => cmd_status(&args[1..]),
         "sleep" => cmd_sleep(&args[1..]),
         "reset-mem" => cmd_reset(&args[1..]),
@@ -83,6 +86,7 @@ fn usage() -> &'static str {
      install-expert --pack FILE.cxex --dir DIR --d-model N --vocab N\n  \
      list-experts --dir DIR\n  \
      logits --model FILE [--ids 1,2,3 | --prompt TEXT]\n  \
+     dump --model FILE [--ids 1,2,3 | --prompt TEXT] [--out FILE]\n  \
      --check-ctxb FILE [--prompt TEXT]\n  \
      /status --model FILE\n  \
      /sleep --model FILE [--steps 2] [--eps 0.02] [--lr 0.01]\n  \
@@ -659,6 +663,191 @@ fn cmd_logits(args: &[String]) -> ExitCode {
         println!("pos={t} id={id} {}", line.join(" "));
     }
     ExitCode::SUCCESS
+}
+
+/// `dump` — diagnostic mirror of the forward pass.
+///
+/// Writes one line per (position, block/macro, quantity), FP vectors in
+/// `%.9e` and INT8 activations as integers:
+///   `S pos=.. block=.. in|out`  SSM block input/output
+///   `SQ/SK/SV/SO/SP`            SSM q/k/v projections, DeltaNet output, o_proj output
+///   `QO`                        o_proj input INT8 quantization
+///   `SX`                        FFN input (norm2 output)
+///   `QX`                        FFN input INT8 quantization
+///   `FG/FU/FH/SF`               FFN gate/up/hidden/down outputs
+///   `X/A/Q/M`                   mem-block input, ring-attention output, hippo q, hippo m
+///   `L pos=..`                  logits
+///
+/// This replicates `BitSsmBlock::forward` and `MemoryBlock::forward_step`
+/// by hand so the intermediates can be dumped; keep it in sync with those
+/// two functions. `dump` output must reproduce `logits` output (the `L`
+/// lines) — the Python self-check verifies that, so drift is caught.
+fn cmd_dump(args: &[String]) -> ExitCode {
+    let (model, _) = match require_model(args) {
+        Ok(m) => m,
+        Err(c) => return c,
+    };
+    let tokens: Vec<u32> = if let Some(prompt) = flag(args, "--prompt") {
+        let tok = match load_tokenizer_arg(args) {
+            Ok(t) => t,
+            Err(c) => return c,
+        };
+        tok.encode(prompt)
+    } else {
+        let ids = flag(args, "--ids").unwrap_or("1");
+        ids.split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    };
+    let mut out: Box<dyn Write> = match flag(args, "--out") {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(f) => Box::new(std::io::BufWriter::new(f)),
+            Err(e) => {
+                eprintln!("create {path}: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    let d = model.cfg.d_model;
+    let mut state: ModelState = model.new_state();
+    for (t, &tok) in tokens.iter().enumerate() {
+        let mut x = model.embed(tok);
+        for m in 0..model.cfg.n_macros {
+            for s in 0..3 {
+                let idx = m * 3 + s;
+                let blk = &model.ssm[idx];
+                if writeln!(out, "S pos={t} block={idx} in {}", fmt_vec(&x)).is_err() {
+                    return ExitCode::from(1);
+                }
+                // Manual replication of BitSsmBlock::forward, with dumps.
+                let xn = blk.norm1.forward(&x);
+                let q = blk.q_proj.forward(&xn);
+                let k = blk.k_proj.forward(&xn);
+                let v = blk.v_proj.forward(&xn);
+                let (alpha, beta) = {
+                    let d = blk.d_model;
+                    let aw = blk.alpha_w.as_slice();
+                    let bw = blk.beta_w.as_slice();
+                    let ab = blk.alpha_b.as_slice();
+                    let bb = blk.beta_b.as_slice();
+                    let mut alpha = vec![0f32; blk.n_heads];
+                    let mut beta = vec![0f32; blk.n_heads];
+                    for h in 0..blk.n_heads {
+                        let mut da = ab[h];
+                        let mut db = bb[h];
+                        let row = h * d;
+                        for i in 0..d {
+                            da += aw[row + i] * xn[i];
+                            db += bw[row + i] * xn[i];
+                        }
+                        alpha[h] = sigmoid(da);
+                        beta[h] = sigmoid(db);
+                    }
+                    (alpha, beta)
+                };
+                let o_delta = deltanet_step(&mut state.ssm[idx], &q, &k, &v, &alpha, &beta);
+                let o = blk.o_proj.forward(&o_delta);
+                let mut x1 = vec![0f32; d];
+                for i in 0..d {
+                    x1[i] = x[i] + o[i];
+                }
+                let xn2 = blk.norm2.forward(&x1);
+                let gate_out = blk.ffn.w_gate.forward(&xn2);
+                let up_out = blk.ffn.w_up.forward(&xn2);
+                let mut hidden = vec![0f32; gate_out.len()];
+                for i in 0..hidden.len() {
+                    hidden[i] = silu(gate_out[i]) * up_out[i];
+                }
+                let ffn = blk.ffn.w_down.forward(&hidden);
+                for i in 0..d {
+                    x1[i] += ffn[i];
+                }
+                x = x1;
+                let (qo, _) = quantize_activations_sym_i8(&o_delta);
+                let (qx, _) = quantize_activations_sym_i8(&xn2);
+                let lines: [(&str, String); 11] = [
+                    ("SP", fmt_vec(&o)),
+                    ("QO", fmt_ints(&qo)),
+                    ("SX", fmt_vec(&xn2)),
+                    ("QX", fmt_ints(&qx)),
+                    ("SQ", fmt_vec(&q)),
+                    ("SK", fmt_vec(&k)),
+                    ("SV", fmt_vec(&v)),
+                    ("SO", fmt_vec(&o_delta)),
+                    ("FG", fmt_vec(&gate_out)),
+                    ("FU", fmt_vec(&up_out)),
+                    ("FH", fmt_vec(&hidden)),
+                ];
+                for (tag, body) in lines {
+                    if writeln!(out, "{tag} pos={t} block={idx} {body}").is_err() {
+                        return ExitCode::from(1);
+                    }
+                }
+                if writeln!(out, "SF pos={t} block={idx} {}", fmt_vec(&ffn)).is_err() {
+                    return ExitCode::from(1);
+                }
+                if writeln!(out, "S pos={t} block={idx} out {}", fmt_vec(&x)).is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            let mem = &model.mem[m];
+            let xn = mem.norm1.forward(&x);
+            let a = mem.attn.forward(&xn, &mut state.rings[m]);
+            if writeln!(out, "X pos={t} macro={m} {}", fmt_vec(&x)).is_err() {
+                return ExitCode::from(1);
+            }
+            if writeln!(out, "A pos={t} macro={m} {}", fmt_vec(&a)).is_err() {
+                return ExitCode::from(1);
+            }
+            let mut q = mem.hip_proj.forward(&xn);
+            l2_normalize_inplace(&mut q);
+            let mut mvec = vec![0f32; d];
+            mem.hip.read_forward(&q, &mut mvec);
+            if writeln!(out, "Q pos={t} macro={m} {}", fmt_vec(&q)).is_err() {
+                return ExitCode::from(1);
+            }
+            if writeln!(out, "M pos={t} macro={m} {}", fmt_vec(&mvec)).is_err() {
+                return ExitCode::from(1);
+            }
+            // Gate + FFN (mirror MemoryBlock::forward_step).
+            let gw = mem.gate_w.as_slice();
+            let gb = mem.gate_b.as_slice();
+            let mut y = vec![0f32; d];
+            for i in 0..d {
+                let g = sigmoid(gw[i] * xn[i] + gb[i]);
+                y[i] = x[i] + g * a[i] + (1.0 - g) * mvec[i];
+            }
+            let xn2 = mem.norm2.forward(&y);
+            let ffn = mem.ffn.forward(&xn2);
+            for i in 0..d {
+                y[i] += ffn[i];
+            }
+            x = y;
+        }
+        let logits = model.logits_from_hidden(&x);
+        if writeln!(out, "L pos={t} {}", fmt_vec(&logits)).is_err() {
+            return ExitCode::from(1);
+        }
+    }
+    if out.flush().is_err() {
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+fn fmt_vec(v: &[f32]) -> String {
+    v.iter()
+        .map(|x| format!("{x:.9e}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fmt_ints(v: &[i8]) -> String {
+    v.iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn cmd_check_ctxb(args: &[String]) -> ExitCode {
