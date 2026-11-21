@@ -202,13 +202,15 @@ def mohawk_mse_step() -> tuple[float, float]:
     target = teacher_h[:, :4].detach()
     student_h = torch.nn.Parameter(torch.zeros(6, 4))
     opt = torch.optim.SGD([student_h], lr=0.2)
-    first = float(F.mse_loss(student_h.detach(), target))
+    with torch.no_grad():
+        first = F.mse_loss(student_h, target).item()
     for _ in range(8):
         opt.zero_grad(set_to_none=True)
         loss = F.mse_loss(student_h, target)
         loss.backward()
         opt.step()
-    last = float(F.mse_loss(student_h.detach(), target))
+    with torch.no_grad():
+        last = F.mse_loss(student_h, target).item()
     return first, last
 
 
