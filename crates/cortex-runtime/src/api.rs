@@ -97,6 +97,7 @@ fn dispatch(req: &str, server: &Server) -> String {
     }
     if method == "POST" && path == "/v1/chat/completions" {
         let prompt = json_string_field(body, "content").unwrap_or_default();
+        let tools_accepted = crate::harness::tools_mentioned(body);
         let stream = body.replace(' ', "").contains("\"stream\":true");
         let max_tokens = json_u32_field(body, "max_tokens").unwrap_or(16).min(64);
         let mut model = server.model.lock().expect("model");
@@ -115,7 +116,7 @@ fn dispatch(req: &str, server: &Server) -> String {
             return sse_ok(&sse);
         }
         let json = format!(
-            "{{\"object\":\"chat.completion\",\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}}}}]}}",
+            "{{\"object\":\"chat.completion\",\"tools_accepted\":{tools_accepted},\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}}}}]}}",
             json_escape(&text)
         );
         return json_ok(&json);

@@ -1,0 +1,25 @@
+{
+  "name": "instruction_mix",
+  "download": false,
+  "purpose": "Design mix for instruction SFT. Not downloaded and not trained.",
+  "components": [
+    {
+      "name": "tulu3",
+      "weight": 0.4,
+      "sources": ["allenai/tulu-3-sft-mixture"],
+      "license": "ODC-By 1.0 is the usual Tulu 3 data card; confirm before use"
+    },
+    {
+      "name": "infinity_instruct",
+      "weight": 0.3,
+      "sources": ["BAAI/Infinity-Instruct"],
+      "license": "Apache-2.0 is commonly listed; confirm the card"
+    },
+    {
+      "name": "magpie",
+      "weight": 0.3,
+      "sources": ["Magpie-Align synthetic instruction sets"],
+      "license": "Often Apache-2.0 for Magpie synthetic sets; confirm the card"
+    }
+  ]
+}

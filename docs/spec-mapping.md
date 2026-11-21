@@ -32,6 +32,11 @@ disagreed with that brief. There is no C toolchain and no autograd inside
 | Step 1 measured 25.1M run | `tools/step1_train.py`, `docs/step1.md` |
 | Step 2/3 manifests and the three cleaners | `tools/prepare_corpus.py`, `configs/` |
 | Qwen3-28B distill scaffold (mock teacher by default) | `tools/distill_qwen.py` |
+| L2 experts, packages, router | `crates/cortex-runtime/src/expert.rs` |
+| L3 verified traces | `crates/cortex-runtime/src/traces.rs`, `tools/traces.py` |
+| Tool harness and constrained JSON | `harness.rs`, `grammar.rs` |
+| Family presets Nano / Pro / Max | `crates/cortex-runtime/src/family.rs` |
+| Instruction and tool manifests, DPO/GRPO scaffolds | `tools/align_recipes.py`, `configs/` |
 
 ## Recurrence actually implemented
 

@@ -1,0 +1,31 @@
+{
+  "name": "tool_trajectory_mix",
+  "download": false,
+  "purpose": "Design mix for tool-calling SFT. Not downloaded and not trained.",
+  "components": [
+    {
+      "name": "single_or_parallel_calls",
+      "weight": 0.5,
+      "sources": ["Salesforce xlam-function-calling-60k", "NousResearch hermes-function-calling", "ToolACE"],
+      "license": "xlam-function-calling-60k is commonly CC-BY-4.0; hermes-function-calling and ToolACE: confirm each dataset card before use"
+    },
+    {
+      "name": "error_recovery",
+      "weight": 0.2,
+      "sources": ["synthetic recovery traces derived from the tool schemas"],
+      "license": "Original synthetic"
+    },
+    {
+      "name": "clarification",
+      "weight": 0.15,
+      "sources": ["synthetic turns that ask for missing required arguments and do not invent them"],
+      "license": "Original synthetic"
+    },
+    {
+      "name": "chit_chat_tools_present",
+      "weight": 0.15,
+      "sources": ["synthetic chit-chat where tools are listed and must not be called"],
+      "license": "Original synthetic"
+    }
+  ]
+}

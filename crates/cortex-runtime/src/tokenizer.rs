@@ -8,6 +8,66 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+/// Ids at and above this value are atomic specials, not BPE pieces.
+pub const SPECIAL_BASE: u32 = 1_000_000;
+
+pub const SPECIALS: &[&str] = &[
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|thought|>",
+    "</|thought|>",
+    "<|tools|>",
+    "</|tools|>",
+    "<|tool_call|>",
+    "</|tool_call|>",
+    "<|tool_response|>",
+    "</|tool_response|>",
+];
+
+pub const TOOL_CALL_OPEN: &str = "<|tool_call|>";
+pub const TOOL_CALL_CLOSE: &str = "</|tool_call|>";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatTurn {
+    pub role: Role,
+    pub content: String,
+}
+
+pub fn render_chat(turns: &[ChatTurn]) -> String {
+    let mut out = String::new();
+    for turn in turns {
+        out.push_str("<|im_start|>");
+        out.push_str(turn.role.as_str());
+        out.push('\n');
+        out.push_str(&turn.content);
+        out.push_str("<|im_end|>\n");
+    }
+    out
+}
+
+pub fn special_id(index: usize) -> u32 {
+    SPECIAL_BASE + index as u32
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Tokenizer {
     /// Merge `i` consumes the pair `(left, right)` and emits id `256 + i`.
@@ -62,13 +122,22 @@ impl Tokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        for piece in split_specials(text) {
+            match piece {
+                Piece::Special(id) => out.push(id),
+                Piece::Text(chunk) => out.extend(self.encode_plain(chunk)),
+            }
+        }
+        out
+    }
+
+    fn encode_plain(&self, text: &str) -> Vec<u32> {
         if self.merges.is_empty() {
             return text.bytes().map(|b| b as u32).collect();
         }
         // Newlines are never inside a trained merge (BPE is fit per line), so
         // they stay a single byte id and sequences encode independently.
-        // Within a line, merges apply in rank order. A rank is skipped when
-        // its pair is absent, which matches a full scan that changes nothing.
         let bytes = text.as_bytes();
         let mut out = Vec::new();
         let mut start = 0usize;
@@ -100,6 +169,13 @@ impl Tokenizer {
     }
 
     fn expand(&self, id: u32, out: &mut Vec<u8>) {
+        if id >= SPECIAL_BASE {
+            let index = (id - SPECIAL_BASE) as usize;
+            if let Some(token) = SPECIALS.get(index) {
+                out.extend_from_slice(token.as_bytes());
+            }
+            return;
+        }
         if id < 256 {
             out.push(id as u8);
             return;
@@ -110,6 +186,45 @@ impl Tokenizer {
             self.expand(right, out);
         }
     }
+}
+
+enum Piece<'a> {
+    Text(&'a str),
+    Special(u32),
+}
+
+fn split_specials(text: &str) -> Vec<Piece<'_>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut start = 0usize;
+    while i < bytes.len() {
+        if let Some((len, id)) = match_special(&bytes[i..]) {
+            if start < i {
+                out.push(Piece::Text(&text[start..i]));
+            }
+            out.push(Piece::Special(id));
+            i += len;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push(Piece::Text(&text[start..]));
+    }
+    out
+}
+
+fn match_special(bytes: &[u8]) -> Option<(usize, u32)> {
+    let mut best: Option<(usize, u32)> = None;
+    for (index, token) in SPECIALS.iter().enumerate() {
+        let raw = token.as_bytes();
+        if bytes.starts_with(raw) && best.map(|(len, _)| raw.len() > len).unwrap_or(true) {
+            best = Some((raw.len(), special_id(index)));
+        }
+    }
+    best
 }
 
 fn encode_segment(bytes: &[u8], merges: &[(u32, u32)]) -> Vec<u32> {
@@ -183,6 +298,30 @@ mod tests {
         let ids = tok.encode("abXab");
         assert_eq!(ids, vec![256, b'X' as u32, 256]);
         assert_eq!(tok.decode_string(&ids), "abXab");
+    }
+
+    #[test]
+    fn specials_are_atomic() {
+        let tok = Tokenizer::byte_level();
+        let text = "a<|tool_call|>{\"name\":\"add\"}</|tool_call|>b";
+        let ids = tok.encode(text);
+        let specials = ids.iter().filter(|id| **id >= SPECIAL_BASE).count();
+        assert_eq!(specials, 2, "{ids:?}");
+        assert_eq!(tok.decode_string(&ids), text);
+        let rendered = render_chat(&[
+            ChatTurn {
+                role: Role::User,
+                content: "hi".into(),
+            },
+            ChatTurn {
+                role: Role::Assistant,
+                content: "ok".into(),
+            },
+        ]);
+        let again = tok.decode_string(&tok.encode(&rendered));
+        assert_eq!(again, rendered);
+        assert!(rendered.contains("<|im_start|>user"));
+        assert!(rendered.contains("<|im_start|>assistant"));
     }
 
     #[test]

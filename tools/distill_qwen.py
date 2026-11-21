@@ -190,6 +190,64 @@ def export_hook(path: Path) -> None:
         raise RuntimeError(f"ctxb crc {got:#x} != {crc:#x}")
 
 
+def mohawk_mse_step() -> tuple[float, float]:
+    """Attention hidden states → Gated DeltaNet hidden states.
+
+    The mock teacher width is 8 and the student width is 4. A learned map
+    bridges them. Q/K/V are not copied when the shapes differ; that is the
+    honest mismatch path. One SGD step should reduce MSE.
+    """
+    torch.manual_seed(0)
+    teacher_h = torch.randn(6, 8)
+    target = teacher_h[:, :4].detach()
+    student_h = torch.nn.Parameter(torch.zeros(6, 4))
+    opt = torch.optim.SGD([student_h], lr=0.2)
+    first = float(F.mse_loss(student_h.detach(), target))
+    for _ in range(8):
+        opt.zero_grad(set_to_none=True)
+        loss = F.mse_loss(student_h, target)
+        loss.backward()
+        opt.step()
+    last = float(F.mse_loss(student_h.detach(), target))
+    return first, last
+
+
+def progressive_qat_kl() -> list[float]:
+    """λ goes 0 → 1. Loss is CE plus KL to mapped teacher logits."""
+    torch.manual_seed(1)
+    logits = torch.nn.Parameter(torch.zeros(4))
+    opt = torch.optim.SGD([logits], lr=0.4)
+    target = torch.tensor(2)
+    teacher = torch.tensor([0.05, 0.05, 0.8, 0.1])
+    losses = []
+    for step in range(6):
+        lam = step / 5
+        opt.zero_grad(set_to_none=True)
+        log_probs = F.log_softmax(logits, dim=-1)
+        ce = F.nll_loss(log_probs.unsqueeze(0), target.unsqueeze(0))
+        kl = torch.sum(teacher * (torch.log(teacher) - log_probs))
+        loss = (1.0 - lam) * ce + lam * kl
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.detach()))
+    return losses
+
+
+def freeze_trunk_train_gates() -> bool:
+    trunk = torch.nn.Linear(4, 4)
+    gate = torch.nn.Linear(4, 1)
+    for param in trunk.parameters():
+        param.requires_grad_(False)
+    opt = torch.optim.SGD(gate.parameters(), lr=0.1)
+    x = torch.randn(3, 4)
+    loss = F.mse_loss(gate(trunk(x).detach()), torch.ones(3, 1))
+    loss.backward()
+    opt.step()
+    trunk_frozen = all(p.grad is None for p in trunk.parameters())
+    gate_trained = any(p.grad is not None for p in gate.parameters())
+    return trunk_frozen and gate_trained and bool(torch.isfinite(loss))
+
+
 def self_check() -> None:
     teacher = MockTeacher()
     cat_ids = student_encode_bytes("猫")
@@ -215,9 +273,16 @@ def self_check() -> None:
         out = Path(td) / "probe.ctxb"
         export_hook(out)
         _expect(out.stat().st_size > 64, "ctxb size")
+    mse0, mse1 = mohawk_mse_step()
+    _expect(mse1 < mse0, f"MOHAWK MSE {mse0} -> {mse1}")
+    qat = progressive_qat_kl()
+    _expect(all(math.isfinite(x) for x in qat), "qat schedule")
+    _expect(qat[-1] < qat[0], f"progressive KL {qat[0]} -> {qat[-1]}")
+    _expect(freeze_trunk_train_gates(), "hippo gates")
     print(
         f"distill self-check ok: mock teacher vocab {teacher.vocab_size} "
-        f"vs student bytes 256; loss {losses[0]:.4f} -> {losses[-1]:.4f}; ctxb hook ok"
+        f"vs student bytes 256; loss {losses[0]:.4f} -> {losses[-1]:.4f}; "
+        f"mohawk {mse0:.4f}->{mse1:.4f}; qat {qat[0]:.4f}->{qat[-1]:.4f}; ctxb hook ok"
     )
 
 

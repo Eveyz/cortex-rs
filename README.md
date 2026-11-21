@@ -130,6 +130,22 @@ python3 tools/train_seed_qat.py --self-check --steps 2 --joint-hippocampus \
 
 门槛是最大绝对误差 `< 1e-3`。这是 16 维的迷你网，不是 1.6B。
 
+## 设备上的演进和工具（v0.4，只写了代码）
+
+细节在 [docs/evolution.md](docs/evolution.md)。L1 海马体不能打进可分享的专家包。L2 路由只激活选中的槽，有槽位数和磁盘上限，睡眠路径只搭一个未训练的适配器骨架（目标体积 20–50 MB 这一档）。L3 从通过校验的轨迹里丢掉失败绕路。Nano / Pro / Max 是未训练的形状：16 GB 对 Nano 宽裕，对 Pro 更紧，对 Max 很紧。40 tok/s 以上是目标，不是测量。
+
+```bash
+python3 tools/distill_qwen.py --self-check
+python3 tools/align_recipes.py --self-check
+python3 tools/traces.py --self-check
+./target/release/cortex-cli export-expert --domain math --license MIT --d-model 512 --vocab 4096 --out /tmp/math.cxex
+./target/release/cortex-cli install-expert --pack /tmp/math.cxex --dir /tmp/experts --d-model 512 --vocab 4096
+./target/release/cortex-cli list-experts --dir /tmp/experts
+./target/release/cortex-cli generate --model /tmp/mini.ctxb --prompt "hello" --tools tools.txt --max-tokens 8
+```
+
+`tools.txt` 每行一个工具：`add a,b`。指令数据和工具轨迹的配方在 `configs/instruct_mix.json` 与 `configs/tool_mix.json`，权重是 50/20/15/15 的设计比例，没有下载。
+
 ## 训练和推理
 
 | | 种子训练 / 蒸馏 | 板上推理 |

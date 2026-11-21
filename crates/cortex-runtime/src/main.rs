@@ -15,6 +15,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use cortex_runtime::ctxb::{load_ctxb, save_ctxb};
+use cortex_runtime::expert::{
+    list_packages, load_package, save_package, tiny_adapter, ExpertMeta, ExpertPackage, ROUTER_ABI,
+};
 use cortex_runtime::generate::{format_tick, next_token, rss_kb, Session};
 use cortex_runtime::model::{CortexConfig, CortexModel};
 use cortex_runtime::tokenizer::Tokenizer;
@@ -42,6 +45,9 @@ fn main() -> ExitCode {
         "serve" => cmd_serve(&args[1..]),
         "init-mini" => cmd_init_mini(&args[1..]),
         "encode" => cmd_encode(&args[1..]),
+        "export-expert" => cmd_export_expert(&args[1..]),
+        "install-expert" => cmd_install_expert(&args[1..]),
+        "list-experts" => cmd_list_experts(&args[1..]),
         other => {
             eprintln!("unknown command {other}\n{}", usage());
             ExitCode::from(2)
@@ -54,6 +60,9 @@ fn usage() -> &'static str {
      generate --model FILE --prompt TEXT [--vocab MERGES] [--max-tokens 32] [--temperature 0.8]\n            \
      [--top-p 0.9] [--repetition-penalty 1.1] [--seed 1]\n  \
      encode --vocab MERGES --input TEXT --output TOKENS.u32\n  \
+     export-expert --domain NAME --license MIT --d-model N --vocab N --out FILE.cxex\n  \
+     install-expert --pack FILE.cxex --dir DIR --d-model N --vocab N\n  \
+     list-experts --dir DIR\n  \
      logits --model FILE --ids 1,2,3\n  \
      /status --model FILE\n  \
      /sleep --model FILE\n  \
@@ -104,6 +113,17 @@ fn cmd_generate(args: &[String]) -> ExitCode {
     let seed: u64 = flag(args, "--seed")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
+    if let Some(tools) = flag(args, "--tools") {
+        let text = match std::fs::read_to_string(tools) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("tools {tools}: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let specs = cortex_runtime::harness::load_tool_file(&text);
+        println!("tools={}", specs.len());
+    }
     let tokenizer = match flag(args, "--vocab") {
         Some(path) => match Tokenizer::from_merge_file(std::path::Path::new(path)) {
             Ok(tok) => tok,
@@ -181,6 +201,105 @@ fn cmd_encode(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     eprintln!("tokens={}", ids.len());
+    ExitCode::SUCCESS
+}
+
+fn cmd_export_expert(args: &[String]) -> ExitCode {
+    let domain = flag(args, "--domain").unwrap_or("general");
+    let license = flag(args, "--license").unwrap_or("MIT");
+    let d_model: u32 = flag(args, "--d-model")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    let vocab: u32 = flag(args, "--vocab")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096);
+    let out = match flag(args, "--out") {
+        Some(p) => p,
+        None => {
+            eprintln!("missing --out");
+            return ExitCode::from(2);
+        }
+    };
+    let meta = ExpertMeta {
+        name: domain.to_string(),
+        domain: domain.to_string(),
+        license: license.to_string(),
+        d_model,
+        vocab,
+        router_abi: ROUTER_ABI,
+    };
+    let pkg = match ExpertPackage::export(meta, tiny_adapter(domain, 1)) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("export: {err:?}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(err) = save_package(std::path::Path::new(out), &pkg) {
+        eprintln!("write: {err}");
+        return ExitCode::from(1);
+    }
+    println!("exported {out}");
+    ExitCode::SUCCESS
+}
+
+fn cmd_install_expert(args: &[String]) -> ExitCode {
+    let pack = match flag(args, "--pack") {
+        Some(p) => p,
+        None => {
+            eprintln!("missing --pack");
+            return ExitCode::from(2);
+        }
+    };
+    let dir = flag(args, "--dir").unwrap_or("experts");
+    let pkg = match load_package(std::path::Path::new(pack)) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("load: {err:?}");
+            return ExitCode::from(1);
+        }
+    };
+    let d_model: u32 = flag(args, "--d-model")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(pkg.meta.d_model);
+    let vocab: u32 = flag(args, "--vocab")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(pkg.meta.vocab);
+    if pkg.meta.d_model != d_model || pkg.meta.vocab != vocab || pkg.meta.router_abi != ROUTER_ABI {
+        eprintln!("incompatible expert");
+        return ExitCode::from(1);
+    }
+    let dest = std::path::Path::new(dir).join(format!("{}.cxex", pkg.meta.domain));
+    if let Err(err) = save_package(&dest, &pkg) {
+        eprintln!("install: {err}");
+        return ExitCode::from(1);
+    }
+    println!("installed {}", dest.display());
+    ExitCode::SUCCESS
+}
+
+fn cmd_list_experts(args: &[String]) -> ExitCode {
+    let dir = flag(args, "--dir").unwrap_or("experts");
+    let found = list_packages(std::path::Path::new(dir));
+    if found.is_empty() {
+        println!("experts=0");
+        return ExitCode::SUCCESS;
+    }
+    for path in &found {
+        match load_package(path) {
+            Ok(pkg) => println!(
+                "{} domain={} license={} d_model={} vocab={} abi={}",
+                path.display(),
+                pkg.meta.domain,
+                pkg.meta.license,
+                pkg.meta.d_model,
+                pkg.meta.vocab,
+                pkg.meta.router_abi
+            ),
+            Err(err) => println!("{} error={err:?}", path.display()),
+        }
+    }
+    println!("experts={}", found.len());
     ExitCode::SUCCESS
 }
 

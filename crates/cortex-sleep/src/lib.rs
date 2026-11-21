@@ -11,6 +11,11 @@
 
 mod mezo;
 mod replay;
+mod scaffold;
 
 pub use mezo::{mezo_3pass, rademacher, InPlacePhi};
 pub use replay::{pick_source, take, ReplaySource};
+pub use scaffold::{
+    scaffold_expert, ExpertScaffold, SurpriseLog, ADAPTER_BYTES_DEFAULT, ADAPTER_BYTES_MAX,
+    ADAPTER_BYTES_MIN,
+};

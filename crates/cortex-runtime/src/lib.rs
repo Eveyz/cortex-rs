@@ -6,10 +6,15 @@
 
 pub mod api;
 pub mod ctxb;
+pub mod expert;
+pub mod family;
 pub mod generate;
+pub mod grammar;
+pub mod harness;
 pub mod model;
 pub mod sample;
 pub mod tokenizer;
+pub mod traces;
 
 pub use ctxb::{from_ctxb, load_ctxb, save_ctxb, to_ctxb};
 pub use model::{CortexConfig, CortexModel};

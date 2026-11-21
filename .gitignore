@@ -9,6 +9,7 @@ data/step1/sample_for_bpe.txt
 artifacts/
 **/*.rs.bk
 *.ctxb
+*.cxex
 .DS_Store
 __pycache__/
 *.pyc
