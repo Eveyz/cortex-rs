@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Instruction and tool-calling scaffolds. No downloads and no training.
+"""Instruction and tool-calling alignment recipes (no network downloads).
 
-Prompt-loss masking, DPO/SimPO, and GRPO/RLVR are checked on dummy tensors.
-Manifest weights are checked against the committed JSON files.
+Implements:
+- ChatML rendering with the 10 dense atomic control tokens (`SPECIALS`),
+- Character-level `prompt_loss_mask` AND token-level `masked_sft_labels`
+  (`ignore_index = -100` on system/user/tool turns, supervising only assistant
+  completions + `<|im_end|>`),
+- `masked_ce_loss` over `[B, T, V]` logits,
+- DPO / SimPO preference losses and GRPO / RLVR verifiable tool-use rewards.
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ SPECIALS = (
     "</|tool_response|>",
 )
 
+IGNORE_INDEX = -100
+
 
 def render_chat(turns: list[tuple[str, str]]) -> str:
     parts = []
@@ -38,7 +45,7 @@ def render_chat(turns: list[tuple[str, str]]) -> str:
 
 
 def prompt_loss_mask(turns: list[tuple[str, str]]) -> list[int]:
-    """1 on assistant content characters, 0 elsewhere. Loss hooks use this mask."""
+    """1 on assistant content characters, 0 elsewhere."""
     mask: list[int] = []
     for role, content in turns:
         prefix = f"<|im_start|>{role}\n"
@@ -50,15 +57,70 @@ def prompt_loss_mask(turns: list[tuple[str, str]]) -> list[int]:
     return mask
 
 
+def encode_with_specials(text: str, special_base: int = 256) -> list[int]:
+    """Byte-fallback encoding with dense atomic special IDs (`256..266`)."""
+    raw = text.encode("utf-8")
+    special_bytes = [(i, tok.encode("utf-8")) for i, tok in enumerate(SPECIALS)]
+    ids: list[int] = []
+    pos = 0
+    while pos < len(raw):
+        matched = None
+        for idx, sb in special_bytes:
+            if raw[pos:].startswith(sb):
+                if matched is None or len(sb) > matched[0]:
+                    matched = (len(sb), special_base + idx)
+        if matched is not None:
+            ids.append(matched[1])
+            pos += matched[0]
+        else:
+            ids.append(raw[pos])
+            pos += 1
+    return ids
+
+
+def masked_sft_labels(
+    turns: list[tuple[str, str]], special_base: int = 256
+) -> tuple[list[int], list[int]]:
+    """Tokenize `turns` and mask non-assistant tokens with `IGNORE_INDEX = -100`."""
+    ids: list[int] = []
+    labels: list[int] = []
+    im_end_id = special_base + 1
+    for role, content in turns:
+        prefix_ids = encode_with_specials(f"<|im_start|>{role}\n", special_base)
+        body_ids = encode_with_specials(content, special_base)
+        suffix_ids = [im_end_id, ord("\n")]
+        ids.extend(prefix_ids)
+        labels.extend([IGNORE_INDEX] * len(prefix_ids))
+        ids.extend(body_ids)
+        if role == "assistant":
+            labels.extend(body_ids)
+            ids.extend(suffix_ids)
+            labels.extend([im_end_id, IGNORE_INDEX])
+        else:
+            labels.extend([IGNORE_INDEX] * len(body_ids))
+            ids.extend(suffix_ids)
+            labels.extend([IGNORE_INDEX] * len(suffix_ids))
+    return ids, labels
+
+
+def masked_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Autoregressive next-token CE ignoring `IGNORE_INDEX = -100`."""
+    return F.cross_entropy(
+        logits[:, :-1].reshape(-1, logits.size(-1)),
+        labels[:, 1:].reshape(-1),
+        ignore_index=IGNORE_INDEX,
+    )
+
+
 def dpo_loss(policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta: float = 0.1):
-    """Standard DPO on log-probabilities. No optimizer step is required to call it."""
+    """Standard DPO on log-probabilities."""
     pi = policy_chosen - policy_rejected
     ref = ref_chosen - ref_rejected
     return -F.logsigmoid(beta * (pi - ref))
 
 
 def simpo_loss(policy_chosen, policy_rejected, gamma: float = 1.0, beta: float = 2.0):
-    """SimPO margin on the policy log-prob gap. Reference-free."""
+    """Reference-free SimPO margin on the policy log-prob gap."""
     return -F.logsigmoid(beta * (policy_chosen - policy_rejected) - gamma)
 
 
@@ -74,7 +136,7 @@ def grpo_advantages(rewards: list[float]) -> list[float]:
 
 
 def rlvr_reward(parsed: bool, schema_ok: bool, sandbox_ok: bool | None) -> float:
-    """Deterministic reward. Sandbox is optional."""
+    """Deterministic verifiable tool-use reward."""
     score = 0.0
     if parsed:
         score += 0.4
@@ -93,21 +155,31 @@ def self_check() -> None:
     turns = [
         ("system", "You are local."),
         ("user", "add 2 and 3"),
-        ("assistant", "I will call add."),
+        ("assistant", "<|thought|>sum</|thought|><|tool_call|>{\"name\":\"add\"}</|tool_call|>"),
     ]
     text = render_chat(turns)
-    for token in SPECIALS:
-        assert token in text or token.startswith("<|tool") or token.startswith("<|thought") or token.startswith("</")
     assert "<|im_start|>assistant" in text
     mask = prompt_loss_mask(turns)
     assert len(mask) == len(text)
-    assert sum(mask) == len("I will call add.")
+    assert sum(mask) == len(turns[2][1])
     assert mask[0] == 0
+
+    ids, labels = masked_sft_labels(turns)
+    assert len(ids) == len(labels)
+    assert max(ids) < 266
+    supervised = [l for l in labels if l != IGNORE_INDEX]
+    assert len(supervised) > 0 and 257 in supervised  # <|im_end|> supervised on assistant turn
+    dummy_logits = torch.randn(1, len(ids), 266, requires_grad=True)
+    loss = masked_ce_loss(dummy_logits, torch.tensor([labels], dtype=torch.long))
+    loss.backward()
+    assert torch.isfinite(loss) and dummy_logits.grad is not None
 
     chosen = torch.tensor(0.0)
     rejected = torch.tensor(-1.0)
     loss_near = dpo_loss(chosen, rejected, torch.tensor(0.0), torch.tensor(0.0), beta=0.1)
-    loss_far = dpo_loss(torch.tensor(2.0), torch.tensor(-2.0), torch.tensor(0.0), torch.tensor(0.0), beta=0.1)
+    loss_far = dpo_loss(
+        torch.tensor(2.0), torch.tensor(-2.0), torch.tensor(0.0), torch.tensor(0.0), beta=0.1
+    )
     assert torch.isfinite(loss_near) and float(loss_far) < float(loss_near)
     sim = simpo_loss(torch.tensor(1.0), torch.tensor(-1.0))
     assert torch.isfinite(sim)

@@ -1,10 +1,9 @@
-//! INT8 ring sliding-window attention.
+//! INT8 ring sliding-window attention (Branch A of Layer 4).
 //!
-//! Keys and values are quantized to symmetric INT8 when they enter the ring.
-//! The ring is allocated once at `window` slots (production default 512) and
-//! never grows with the session length. Scores are the dequantized dot
-//! product, scaled by `1/sqrt(head_dim)`, with a causal mask over the slots
-//! that have actually been written.
+//! Keys and values are quantized per-head to symmetric INT8 (`[-127, +127]`)
+//! when they enter the ring. The ring is allocated once at `window` slots
+//! (production default `W = 512`) and never grows with session length — even
+//! after 10,000+ streaming tokens, KV memory is strictly O(1).
 
 use cortex_kernels::{quantize_activations_sym_i8, BitLinearWeights};
 
@@ -13,7 +12,9 @@ pub struct RingState {
     v: Vec<i8>,
     k_scale: Vec<f32>,
     v_scale: Vec<f32>,
-    /// Next write index in `0..window`.
+    /// Pre-allocated softmax scratch of length `window` (zero per-step alloc).
+    scores_scratch: Vec<f32>,
+    /// Next write index (monotonically increasing, wrapped by `% window`).
     pos: usize,
     filled: usize,
     window: usize,
@@ -30,6 +31,7 @@ impl RingState {
             v: vec![0i8; slots * width],
             k_scale: vec![1.0; slots * n_heads],
             v_scale: vec![1.0; slots * n_heads],
+            scores_scratch: vec![0.0; slots],
             pos: 0,
             filled: 0,
             window: slots,
@@ -47,12 +49,17 @@ impl RingState {
         self.v.fill(0);
         self.k_scale.fill(1.0);
         self.v_scale.fill(1.0);
+        self.scores_scratch.fill(0.0);
         self.pos = 0;
         self.filled = 0;
     }
 
     pub fn filled(&self) -> usize {
         self.filled
+    }
+
+    pub fn window(&self) -> usize {
+        self.window
     }
 }
 
@@ -106,7 +113,7 @@ impl RingSlidingAttention {
         RingState::new(self.window, self.n_heads, self.head_dim)
     }
 
-    /// Push the current token and attend over the retained window.
+    /// Push the current token into the INT8 ring and attend over retained slots.
     pub fn forward(&self, x: &[f32], state: &mut RingState) -> Vec<f32> {
         assert_eq!(x.len(), self.d_model);
         let q = self.w_q.forward(x);
@@ -137,44 +144,45 @@ impl RingSlidingAttention {
     }
 }
 
-fn attend(state: &RingState, q: &[f32]) -> Vec<f32> {
+fn attend(state: &mut RingState, q: &[f32]) -> Vec<f32> {
     let n = state.n_heads;
     let d = state.head_dim;
     let width = n * d;
     let scale = 1.0 / (d as f32).sqrt();
     let mut out = vec![0f32; width];
-    if state.filled == 0 {
+    let filled = state.filled;
+    if filled == 0 {
         return out;
     }
-    // Chronological order, oldest first.
-    let start = if state.filled == state.window {
-        state.pos % state.window
+    let window = state.window;
+    let start = if filled == window {
+        state.pos % window
     } else {
         0
     };
+    let scores = &mut state.scores_scratch[..filled];
     for h in 0..n {
-        let mut scores = vec![0f32; state.filled];
         let qh = &q[h * d..h * d + d];
-        for t in 0..state.filled {
-            let slot = (start + t) % state.window;
+        for (t, score_slot) in scores.iter_mut().enumerate().take(filled) {
+            let slot = (start + t) % window;
             let ks = state.k_scale[slot * n + h];
             let src = slot * width + h * d;
             let mut dot = 0f32;
-            for i in 0..d {
-                dot += qh[i] * (state.k[src + i] as f32) * ks;
+            for (i, &qv) in qh.iter().enumerate().take(d) {
+                dot += qv * (state.k[src + i] as f32) * ks;
             }
-            scores[t] = dot * scale;
+            *score_slot = dot * scale;
         }
-        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0f32;
         for s in scores.iter_mut() {
             *s = (*s - max_s).exp();
             sum += *s;
         }
         let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
-        for t in 0..state.filled {
-            let w = scores[t] * inv;
-            let slot = (start + t) % state.window;
+        for (t, &sv) in scores.iter().enumerate().take(filled) {
+            let w = sv * inv;
+            let slot = (start + t) % window;
             let vs = state.v_scale[slot * n + h];
             let src = slot * width + h * d;
             for i in 0..d {
@@ -190,17 +198,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ring_capacity_does_not_grow() {
-        let attn = RingSlidingAttention::from_seed(32, 4, 8, 8, 3);
+    fn ring_10000_steps_zero_memory_growth() {
+        let attn = RingSlidingAttention::from_seed(32, 4, 8, 512, 3);
         let mut st = attn.new_state();
         let b0 = st.state_bytes();
-        let x = vec![0.1f32; 32];
-        for _ in 0..40 {
+        let mut x = vec![0.1f32; 32];
+        for step in 0..10_000usize {
+            x[step % 32] = ((step as f32) * 0.03).sin() * 0.5;
             let y = attn.forward(&x, &mut st);
             assert!(y.iter().all(|v| v.is_finite()));
             assert_eq!(st.state_bytes(), b0);
-            assert!(st.filled() <= 8);
+            assert!(st.filled() <= 512);
         }
-        assert_eq!(st.filled(), 8);
+        assert_eq!(st.filled(), 512);
+    }
+
+    #[test]
+    fn ring_single_entry_recalls_quantized_value() {
+        let mut st = RingState::new(4, 1, 4);
+        let attn = RingSlidingAttention::zeros(4, 1, 4, 4);
+        let k = [0.5f32, -1.0, 0.25, 0.75];
+        let v = [1.0f32, 2.0, -1.0, 0.5];
+        attn.push(&mut st, &k, &v);
+        let out = attend(&mut st, &k);
+        for i in 0..4 {
+            assert!(
+                (out[i] - v[i]).abs() < 0.05,
+                "recall err at {i}: {} vs {}",
+                out[i],
+                v[i]
+            );
+        }
     }
 }

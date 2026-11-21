@@ -48,9 +48,11 @@ mod tests {
 
     #[test]
     fn family_shapes_are_untrained_labels() {
-        assert!(NANO.disk_bytes_design < PRO.disk_bytes_design);
-        assert!(PRO.disk_bytes_design < MAX.disk_bytes_design);
-        assert!(MAX.active_params_design < MAX.total_params_design);
+        const _: () = {
+            assert!(NANO.disk_bytes_design < PRO.disk_bytes_design);
+            assert!(PRO.disk_bytes_design < MAX.disk_bytes_design);
+            assert!(MAX.active_params_design < MAX.total_params_design);
+        };
         assert!(NANO.ram_note.contains("comfortable"));
         assert!(PRO.ram_note.contains("tighter"));
         assert!(MAX.ram_note.contains("tight"));

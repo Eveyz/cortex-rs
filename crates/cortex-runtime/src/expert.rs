@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn adapter_plan_is_in_the_shareable_band() {
         let (_rows, _cols, packed) = adapter_plan(24 * 1024 * 1024);
-        assert!(packed >= 20 * 1024 * 1024 && packed <= 50 * 1024 * 1024);
+        assert!((20 * 1024 * 1024..=50 * 1024 * 1024).contains(&packed));
     }
 
     #[test]

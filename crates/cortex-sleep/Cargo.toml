@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "In-place MeZO (three passes, one PRNG seed) and 80/20 replay."
+description = "Nightly consolidation: zero-copy 3-pass MeZO, 80/20 WAL replay, Gram-Schmidt hippocampus orthogonalization, L2 expert scaffolding."
 publish = false
 
 [dependencies]
+cortex-hippocampus = { path = "../cortex-hippocampus" }

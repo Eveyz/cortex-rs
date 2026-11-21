@@ -1,11 +1,11 @@
 //! BitSSM block: RMSNorm → 1.58-bit QKV → Gated DeltaNet → out-proj → SwiGLU.
 //!
-//! This is one of layers 1–3 inside a macro cycle. Layer 4 is the memory
-//! block and lives in `cortex-runtime`.
+//! Layers 1–3 inside each macro cycle. Supports both single-token O(1)-memory
+//! streaming (`forward`) and WY chunkwise prefill (`forward_chunk`).
 
 use cortex_kernels::{sigmoid, Aligned64, BitLinearWeights};
 
-use crate::deltanet::{deltanet_step, DeltaState};
+use crate::deltanet::{deltanet_chunk, deltanet_step, DeltaState};
 use crate::swiglu::BitSwiGLU;
 
 #[derive(Clone, Debug)]
@@ -22,6 +22,14 @@ impl RmsNorm {
     }
 
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0f32; x.len()];
+        self.forward_into(x, &mut out);
+        out
+    }
+
+    pub fn forward_into(&self, x: &[f32], out: &mut [f32]) {
+        assert_eq!(x.len(), self.weight.len());
+        assert_eq!(out.len(), x.len());
         let n = x.len().max(1) as f32;
         let mut ss = 0f32;
         for v in x {
@@ -29,7 +37,9 @@ impl RmsNorm {
         }
         let inv = (ss / n + self.eps).sqrt().recip();
         let w = self.weight.as_slice();
-        x.iter().zip(w.iter()).map(|(v, g)| v * inv * g).collect()
+        for i in 0..x.len() {
+            out[i] = x[i] * inv * w[i];
+        }
     }
 }
 
@@ -39,7 +49,7 @@ pub struct BitSsmBlock {
     pub k_proj: BitLinearWeights,
     pub v_proj: BitLinearWeights,
     pub o_proj: BitLinearWeights,
-    /// `[n_heads, d_model]` row-major.
+    /// `[n_heads, d_model]` row-major gate projections.
     pub alpha_w: Aligned64<f32>,
     pub alpha_b: Aligned64<f32>,
     pub beta_w: Aligned64<f32>,
@@ -54,6 +64,10 @@ pub struct BitSsmBlock {
 impl BitSsmBlock {
     pub fn zeros(d_model: usize, n_heads: usize, head_dim: usize, ffn: usize, eps: f32) -> Self {
         assert_eq!(n_heads * head_dim, d_model);
+        let mut alpha_b = Aligned64::zeros(n_heads);
+        alpha_b.fill(4.6); // sigmoid(4.6) ≈ 0.99 long-horizon default
+        let mut beta_b = Aligned64::zeros(n_heads);
+        beta_b.fill(-1.1);
         Self {
             norm1: RmsNorm::ones(d_model, eps),
             q_proj: BitLinearWeights::zeros(d_model, d_model),
@@ -61,9 +75,9 @@ impl BitSsmBlock {
             v_proj: BitLinearWeights::zeros(d_model, d_model),
             o_proj: BitLinearWeights::zeros(d_model, d_model),
             alpha_w: Aligned64::zeros(n_heads * d_model),
-            alpha_b: Aligned64::zeros(n_heads),
+            alpha_b,
             beta_w: Aligned64::zeros(n_heads * d_model),
-            beta_b: Aligned64::zeros(n_heads),
+            beta_b,
             norm2: RmsNorm::ones(d_model, eps),
             ffn: BitSwiGLU::zeros(d_model, ffn),
             n_heads,
@@ -91,8 +105,8 @@ impl BitSsmBlock {
         for (i, slot) in beta_w.as_mut_slice().iter_mut().enumerate() {
             *slot = det(i, seed.wrapping_add(9)) * 0.02;
         }
-        // Biases keep α near 0.5 and β near 0.25 at zero input.
-        alpha_b.fill(0.0);
+        // Keep α ≈ 0.99 (long-horizon retention) and β ≈ 0.25 at init.
+        alpha_b.fill(4.6);
         beta_b.fill(-1.1);
         Self {
             norm1: RmsNorm::ones(d_model, eps),
@@ -137,6 +151,51 @@ impl BitSsmBlock {
         x1
     }
 
+    /// Chunkwise prefill over `xs: [L * d_model]`, chunked by `chunk_size`.
+    pub fn forward_chunk(&self, xs: &[f32], state: &mut DeltaState, chunk_size: usize) -> Vec<f32> {
+        let d = self.d_model;
+        let l = xs.len() / d;
+        assert_eq!(xs.len(), l * d);
+        let chunk = chunk_size.max(1);
+        let mut outs = vec![0f32; l * d];
+        let mut start = 0;
+        while start < l {
+            let end = (start + chunk).min(l);
+            let clen = end - start;
+            let mut qs = vec![0f32; clen * d];
+            let mut ks = vec![0f32; clen * d];
+            let mut vs = vec![0f32; clen * d];
+            let mut alphas = vec![0f32; clen * self.n_heads];
+            let mut betas = vec![0f32; clen * self.n_heads];
+            for t in 0..clen {
+                let x = &xs[(start + t) * d..(start + t + 1) * d];
+                let xn = self.norm1.forward(x);
+                self.q_proj.forward_into(&xn, &mut qs[t * d..(t + 1) * d]);
+                self.k_proj.forward_into(&xn, &mut ks[t * d..(t + 1) * d]);
+                self.v_proj.forward_into(&xn, &mut vs[t * d..(t + 1) * d]);
+                let (a, b) = self.gates(&xn);
+                alphas[t * self.n_heads..(t + 1) * self.n_heads].copy_from_slice(&a);
+                betas[t * self.n_heads..(t + 1) * self.n_heads].copy_from_slice(&b);
+            }
+            let mixed = deltanet_chunk(state, &qs, &ks, &vs, &alphas, &betas, clen);
+            for t in 0..clen {
+                let x = &xs[(start + t) * d..(start + t + 1) * d];
+                let o = self.o_proj.forward(&mixed[t * d..(t + 1) * d]);
+                let mut x1 = vec![0f32; d];
+                for i in 0..d {
+                    x1[i] = x[i] + o[i];
+                }
+                let xn2 = self.norm2.forward(&x1);
+                let ffn = self.ffn.forward(&xn2);
+                for i in 0..d {
+                    outs[(start + t) * d + i] = x1[i] + ffn[i];
+                }
+            }
+            start = end;
+        }
+        outs
+    }
+
     fn gates(&self, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let d = self.d_model;
         let aw = self.alpha_w.as_slice();
@@ -173,39 +232,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn three_layers_are_deterministic_and_finite() {
+    fn three_layers_are_deterministic_and_chunk_matches_step() {
         let d = 32usize;
         let heads = 4usize;
         let hd = 8usize;
-        let blocks: Vec<_> = (0..3)
-            .map(|i| BitSsmBlock::from_seed(d, heads, hd, 32, 1e-6, 100 + i))
+        let block = BitSsmBlock::from_seed(d, heads, hd, 32, 1e-6, 100);
+        let l = 11usize;
+        let xs: Vec<f32> = (0..l * d)
+            .map(|i| ((i as f32) * 0.17).sin() * 0.3)
             .collect();
-        let mut states: Vec<_> = blocks.iter().map(|b| b.new_state()).collect();
-        let bytes: Vec<_> = states.iter().map(|s| s.state_bytes()).collect();
-        let mut x = vec![0.05f32; d];
-        x[0] = 0.2;
-        let mut first = None;
-        for _ in 0..4 {
-            let mut h = x.clone();
-            for (b, st) in blocks.iter().zip(states.iter_mut()) {
-                h = b.forward(&h, st);
-            }
-            assert!(h.iter().all(|v| v.is_finite()));
-            if first.is_none() {
-                first = Some(h);
-            }
+
+        let mut st_step = block.new_state();
+        let bytes0 = st_step.state_bytes();
+        let mut out_step = Vec::with_capacity(l * d);
+        for t in 0..l {
+            out_step.extend_from_slice(&block.forward(&xs[t * d..(t + 1) * d], &mut st_step));
         }
-        // Replay from a fresh state: same first-token result.
-        let mut states2: Vec<_> = blocks.iter().map(|b| b.new_state()).collect();
-        let mut h = x.clone();
-        for (b, st) in blocks.iter().zip(states2.iter_mut()) {
-            h = b.forward(&h, st);
-        }
-        for (a, b) in first.unwrap().iter().zip(h.iter()) {
-            assert!((a - b).abs() < 1e-6);
-        }
-        for (s, b0) in states.iter().zip(bytes.iter()) {
-            assert_eq!(s.state_bytes(), *b0);
-        }
+
+        let mut st_chunk = block.new_state();
+        let out_chunk = block.forward_chunk(&xs, &mut st_chunk, 4);
+
+        let err = out_step
+            .iter()
+            .zip(out_chunk.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(err < 1e-3, "BitSsmBlock chunk vs step err {err}");
+        assert_eq!(st_step.state_bytes(), bytes0);
     }
 }

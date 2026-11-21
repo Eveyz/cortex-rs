@@ -1,9 +1,13 @@
-//! cortex-cli — local BitSSM + hippocampus runtime.
+//! cortex-cli — local 1.58-bit BitSSM + online neural hippocampus runtime.
 //!
 //! ```text
 //! cortex-cli generate --model toy.ctxb --prompt "hi" --max-tokens 32 \
 //!     --temperature 0.8 --top-p 0.9 --repetition-penalty 1.1 --seed 1
+//! cortex-cli agent --model toy.ctxb --prompt "What is 6 * 7?" --workspace ./cortex-work
+//! cortex-cli tools
+//! cortex-cli repl --model toy.ctxb
 //! cortex-cli logits --model toy.ctxb --ids 1,2,3
+//! cortex-cli --check-ctxb toy.ctxb --prompt "hello"
 //! cortex-cli /status --model toy.ctxb
 //! cortex-cli /sleep --model toy.ctxb
 //! cortex-cli /reset-mem --model toy.ctxb
@@ -11,22 +15,31 @@
 //! ```
 
 use std::env;
-use std::path::PathBuf;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, RwLock};
 
+use cortex_hippocampus::SnapshotStore;
 use cortex_runtime::ctxb::{load_ctxb, save_ctxb};
 use cortex_runtime::expert::{
     list_packages, load_package, save_package, tiny_adapter, ExpertMeta, ExpertPackage, ROUTER_ABI,
 };
+use cortex_runtime::fsm::{FsmEvent, RuntimeFsm};
 use cortex_runtime::generate::{format_tick, next_token, rss_kb, Session};
 use cortex_runtime::model::{CortexConfig, CortexModel};
 use cortex_runtime::tokenizer::Tokenizer;
+use cortex_runtime::tools::{AgentLoop, ToolRegistry};
+use cortex_sleep::ReplayBuffer;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!("{}", usage());
         return ExitCode::from(2);
+    }
+    if args[0] == "--check-ctxb" {
+        return cmd_check_ctxb(&args[1..]);
     }
     if let Some(stripped) = args[0].strip_prefix('/') {
         args[0] = stripped.to_string();
@@ -38,6 +51,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "generate" => cmd_generate(&args[1..]),
+        "agent" => cmd_agent(&args[1..]),
+        "tools" => cmd_tools(),
+        "repl" => cmd_repl(&args[1..]),
         "logits" => cmd_logits(&args[1..]),
         "status" => cmd_status(&args[1..]),
         "sleep" => cmd_sleep(&args[1..]),
@@ -58,21 +74,25 @@ fn main() -> ExitCode {
 fn usage() -> &'static str {
     "cortex-cli commands:\n  \
      generate --model FILE --prompt TEXT [--vocab MERGES] [--max-tokens 32] [--temperature 0.8]\n            \
-     [--top-p 0.9] [--repetition-penalty 1.1] [--seed 1]\n  \
+     [--top-p 0.9] [--repetition-penalty 1.1] [--seed 1] [--no-plasticity] [--save-model]\n  \
+     agent --model FILE --prompt TEXT [--workspace DIR] [--vocab MERGES] [--max-tokens 128] [--max-steps 5]\n  \
+     tools\n  \
+     repl --model FILE [--vocab MERGES] [--workspace DIR]\n  \
      encode --vocab MERGES --input TEXT --output TOKENS.u32\n  \
      export-expert --domain NAME --license MIT --d-model N --vocab N --out FILE.cxex\n  \
      install-expert --pack FILE.cxex --dir DIR --d-model N --vocab N\n  \
      list-experts --dir DIR\n  \
-     logits --model FILE --ids 1,2,3\n  \
+     logits --model FILE [--ids 1,2,3 | --prompt TEXT]\n  \
+     --check-ctxb FILE [--prompt TEXT]\n  \
      /status --model FILE\n  \
-     /sleep --model FILE\n  \
-     /reset-mem --model FILE\n  \
+     /sleep --model FILE [--steps 2] [--eps 0.02] [--lr 0.01]\n  \
+     /reset-mem --model FILE [--version V]\n  \
      serve --model FILE [--bind 127.0.0.1:43123] [--unix PATH]\n  \
-     init-mini --out FILE\n\n\
+     init-mini --out FILE [--shape mini|tiny|256|micro|step1] [--seed 1]\n\n\
 Sampling: temperature 0 is greedy; otherwise softmax(logits/T) over the top-p nucleus,\n\
-with a repetition penalty on tokens already emitted.\n\
-/sleep runs one in-place MeZO step on anchor sequences (no autograd).\n\
-/reset-mem restores hippocampus θ to its deterministic init."
+with repetition penalty and constrained JSON Grammar FSM masking inside <|tool_call|>.\n\
+/sleep runs 80% WAL + 20% anchor mixed replay with zero-copy in-place MeZO + Gram-Schmidt consolidation.\n\
+/reset-mem rolls hippocampus back to the prior HPSP snapshot (or deterministic init)."
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -81,19 +101,52 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(|w| w[1].as_str())
 }
 
-fn require_model(args: &[String]) -> Result<CortexModel, ExitCode> {
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+fn wal_dir_for(model_path: &Path) -> PathBuf {
+    model_path.with_extension("wal")
+}
+
+fn snap_dir_for(model_path: &Path) -> PathBuf {
+    model_path.with_extension("snaps")
+}
+
+fn anchor_seqs_for(vocab: usize) -> Vec<Vec<u32>> {
+    let cap = vocab.max(2) as u32;
+    vec![
+        vec![1 % cap, 2 % cap, 3 % cap, 4 % cap],
+        vec![4 % cap, 3 % cap, 2 % cap, 1 % cap],
+        vec![1 % cap, 1 % cap, 2 % cap, 2 % cap],
+    ]
+}
+
+fn require_model(args: &[String]) -> Result<(CortexModel, PathBuf), ExitCode> {
     let path = flag(args, "--model").ok_or_else(|| {
         eprintln!("missing --model");
         ExitCode::from(2)
     })?;
-    load_ctxb(std::path::Path::new(path)).map_err(|e| {
+    let pb = PathBuf::from(path);
+    let m = load_ctxb(&pb).map_err(|e| {
         eprintln!("load {path}: {e}");
         ExitCode::from(1)
-    })
+    })?;
+    Ok((m, pb))
+}
+
+fn load_tokenizer_arg(args: &[String]) -> Result<Tokenizer, ExitCode> {
+    match flag(args, "--vocab") {
+        Some(path) => Tokenizer::from_merge_file(Path::new(path)).map_err(|e| {
+            eprintln!("vocab {path}: {e}");
+            ExitCode::from(1)
+        }),
+        None => Ok(Tokenizer::byte_level()),
+    }
 }
 
 fn cmd_generate(args: &[String]) -> ExitCode {
-    let mut model = match require_model(args) {
+    let (model, model_path) = match require_model(args) {
         Ok(m) => m,
         Err(c) => return c,
     };
@@ -113,6 +166,9 @@ fn cmd_generate(args: &[String]) -> ExitCode {
     let seed: u64 = flag(args, "--seed")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
+    let online_plasticity = !has_flag(args, "--no-plasticity");
+    let save_model = has_flag(args, "--save-model");
+
     if let Some(tools) = flag(args, "--tools") {
         let text = match std::fs::read_to_string(tools) {
             Ok(t) => t,
@@ -124,18 +180,18 @@ fn cmd_generate(args: &[String]) -> ExitCode {
         let specs = cortex_runtime::harness::load_tool_file(&text);
         println!("tools={}", specs.len());
     }
-    let tokenizer = match flag(args, "--vocab") {
-        Some(path) => match Tokenizer::from_merge_file(std::path::Path::new(path)) {
-            Ok(tok) => tok,
-            Err(e) => {
-                eprintln!("vocab {path}: {e}");
-                return ExitCode::from(1);
-            }
-        },
-        None => Tokenizer::byte_level(),
+
+    let tokenizer = match load_tokenizer_arg(args) {
+        Ok(tok) => tok,
+        Err(c) => return c,
     };
-    let mut session = Session::with_tokenizer(
-        &mut model,
+
+    if online_plasticity {
+        model.attach_wal_dir(&wal_dir_for(&model_path));
+    }
+
+    let mut session = Session::with_options(
+        &model,
         prompt,
         max_tokens,
         temperature,
@@ -143,15 +199,291 @@ fn cmd_generate(args: &[String]) -> ExitCode {
         penalty,
         seed,
         tokenizer,
+        online_plasticity,
+        true,
+        true,
     );
     let mut n = 0usize;
     while let Some(tick) = next_token(&mut session) {
         println!("{}", format_tick(&tick));
         n += 1;
     }
+    if online_plasticity {
+        model.flush_hippocampus();
+        if save_model {
+            if let Err(e) = save_ctxb(&model, &model_path) {
+                eprintln!("save {}: {e}", model_path.display());
+                return ExitCode::from(1);
+            }
+        }
+    }
     println!("tokens={n}");
     println!("continuation={}", session.continuation_text());
     println!("rss_kb={}", rss_kb());
+    ExitCode::SUCCESS
+}
+
+fn cmd_tools() -> ExitCode {
+    println!("{}", ToolRegistry::new().render_system_prompt());
+    ExitCode::SUCCESS
+}
+
+fn cmd_agent(args: &[String]) -> ExitCode {
+    let (model, model_path) = match require_model(args) {
+        Ok(m) => m,
+        Err(c) => return c,
+    };
+    let request = flag(args, "--prompt").unwrap_or("What is 6 * 7?");
+    let workspace = PathBuf::from(flag(args, "--workspace").unwrap_or("./cortex-work"));
+    let max_tokens: usize = flag(args, "--max-tokens")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+    let max_steps: usize = flag(args, "--max-steps")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let tokenizer = match load_tokenizer_arg(args) {
+        Ok(tok) => tok,
+        Err(c) => return c,
+    };
+    if let Err(e) = std::fs::create_dir_all(&workspace) {
+        eprintln!("workspace {}: {e}", workspace.display());
+        return ExitCode::from(1);
+    }
+    model.attach_wal_dir(&wal_dir_for(&model_path));
+    let mut agent = AgentLoop::new(workspace);
+    agent.max_steps = max_steps;
+    let outcome = agent.run(request, &mut |transcript| {
+        let mut session = Session::with_tokenizer(
+            &model,
+            transcript,
+            max_tokens,
+            0.0,
+            1.0,
+            1.0,
+            1,
+            tokenizer.clone(),
+        );
+        while next_token(&mut session).is_some() {}
+        session.continuation_text()
+    });
+    model.flush_hippocampus();
+    if has_flag(args, "--transcript") {
+        println!("{}", outcome.transcript);
+    }
+    println!(
+        "steps={} tool_calls={} finished={}",
+        outcome.steps, outcome.tool_calls, outcome.finished
+    );
+    println!("answer={}", outcome.answer);
+    ExitCode::SUCCESS
+}
+
+struct SleepSummary {
+    before: f32,
+    after: f32,
+    wal_eps: usize,
+    dedup_w1: usize,
+    dedup_w2: usize,
+    snap_ver: Option<u64>,
+}
+
+fn run_sleep_cycle(
+    model: &mut CortexModel,
+    model_path: &Path,
+    steps: usize,
+    eps: f32,
+    lr: f32,
+    seed: u64,
+    fsm: &mut RuntimeFsm,
+) -> Result<SleepSummary, String> {
+    fsm.event(FsmEvent::SleepRequested);
+    model.flush_hippocampus();
+
+    let mut replay = ReplayBuffer::new();
+    let wal_root = wal_dir_for(model_path);
+    for m in 0..model.cfg.n_macros {
+        let wf = wal_root.join(format!("macro_{m}")).join("episodes.wal");
+        if wf.exists() {
+            let _ = replay.load_wal(&wf);
+        }
+    }
+    for seq in anchor_seqs_for(model.cfg.vocab) {
+        replay.add_anchor_tokens(seq);
+    }
+    let wal_eps = replay.wal_episodes.len();
+    let seqs = replay.mixed_token_sequences(10);
+    let (before, after) = model.mezo_steps(&seqs, steps, eps, lr, seed);
+
+    let sdir = snap_dir_for(model_path);
+    let snap_store = SnapshotStore::new(&sdir).map_err(|e| e.to_string())?;
+    if snap_store.list_versions().is_empty() {
+        let pre: Vec<_> = model.mem.iter().map(|m| m.hip.snapshot()).collect();
+        snap_store.save_macros(&pre).map_err(|e| e.to_string())?;
+    }
+    let (dedup_w1, dedup_w2, snap_ver) = model
+        .consolidate_all_hippocampus(Some(&snap_store))
+        .map_err(|e| e.to_string())?;
+    save_ctxb(model, model_path)?;
+    fsm.event(FsmEvent::SleepFinished);
+    Ok(SleepSummary {
+        before,
+        after,
+        wal_eps,
+        dedup_w1,
+        dedup_w2,
+        snap_ver,
+    })
+}
+
+fn run_reset_mem(
+    model: &CortexModel,
+    model_path: &Path,
+    target_version: Option<u64>,
+) -> Result<Option<u64>, String> {
+    model.flush_hippocampus();
+    let sdir = snap_dir_for(model_path);
+    let mut rolled_back = None;
+    if let Ok(store) = SnapshotStore::new(&sdir) {
+        if let Some(ver) = target_version {
+            model
+                .rollback_hippocampus(&store, ver)
+                .map_err(|e| e.to_string())?;
+            rolled_back = Some(ver);
+        } else {
+            let vs = store.list_versions();
+            if vs.len() >= 2 {
+                let prev = vs[vs.len() - 2];
+                if model.rollback_hippocampus(&store, prev).is_ok() {
+                    rolled_back = Some(prev);
+                }
+            }
+        }
+    }
+    if rolled_back.is_none() {
+        model.reset_memory_to_init();
+    }
+    save_ctxb(model, model_path)?;
+    Ok(rolled_back)
+}
+
+fn cmd_repl(args: &[String]) -> ExitCode {
+    let (mut model, model_path) = match require_model(args) {
+        Ok(m) => m,
+        Err(c) => return c,
+    };
+    let tokenizer = match load_tokenizer_arg(args) {
+        Ok(tok) => tok,
+        Err(c) => return c,
+    };
+    let workspace = PathBuf::from(flag(args, "--workspace").unwrap_or("./cortex-work"));
+    let _ = std::fs::create_dir_all(&workspace);
+    model.attach_wal_dir(&wal_dir_for(&model_path));
+
+    let mut fsm = RuntimeFsm::default();
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    println!(
+        "Cortex-Local REPL (layers={} d_model={} isa={}) — type /help for commands",
+        model.n_layers(),
+        model.cfg.d_model,
+        cortex_kernels::active_isa()
+    );
+    loop {
+        print!("cortex> ");
+        let _ = stdout.flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("stdin: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        fsm.event(FsmEvent::UserActivity);
+        match trimmed {
+            "/quit" | "/exit" => break,
+            "/help" => {
+                println!("commands: /status | /sleep | /reset-mem | /tools | /agent <req> | /quit");
+            }
+            "/status" => {
+                println!(
+                    "layers={} d_model={} vocab={} hip_version={} rss_kb={} {}",
+                    model.n_layers(),
+                    model.cfg.d_model,
+                    model.cfg.vocab,
+                    model.hip_version_sum(),
+                    rss_kb(),
+                    fsm.status()
+                );
+            }
+            "/tools" => {
+                println!("{}", ToolRegistry::new().render_system_prompt());
+            }
+            "/sleep" => {
+                match run_sleep_cycle(&mut model, &model_path, 4, 1e-4, 5e-6, 7, &mut fsm) {
+                    Ok(s) => println!(
+                        "slept ce {:.6} -> {:.6} wal_eps={} dedup={}+{} snap={:?} {}",
+                        s.before,
+                        s.after,
+                        s.wal_eps,
+                        s.dedup_w1,
+                        s.dedup_w2,
+                        s.snap_ver,
+                        fsm.status()
+                    ),
+                    Err(e) => eprintln!("sleep error: {e}"),
+                }
+            }
+            "/reset-mem" => match run_reset_mem(&model, &model_path, None) {
+                Ok(rb) => println!("hip_version={} rollback={rb:?}", model.hip_version_sum()),
+                Err(e) => eprintln!("reset-mem error: {e}"),
+            },
+            rest if rest.starts_with("/agent ") => {
+                let req = rest.trim_start_matches("/agent ").trim();
+                let agent = AgentLoop::new(workspace.clone());
+                let out = agent.run(req, &mut |transcript| {
+                    let mut s = Session::with_tokenizer(
+                        &model,
+                        transcript,
+                        96,
+                        0.0,
+                        1.0,
+                        1.0,
+                        1,
+                        tokenizer.clone(),
+                    );
+                    while next_token(&mut s).is_some() {}
+                    s.continuation_text()
+                });
+                model.flush_hippocampus();
+                println!(
+                    "[steps={} calls={}] {}",
+                    out.steps, out.tool_calls, out.answer
+                );
+            }
+            prompt => {
+                let mut s = Session::with_tokenizer(
+                    &model,
+                    prompt,
+                    64,
+                    0.8,
+                    0.9,
+                    1.1,
+                    1,
+                    tokenizer.clone(),
+                );
+                while next_token(&mut s).is_some() {}
+                model.flush_hippocampus();
+                fsm.event(FsmEvent::EndOfSentence);
+                println!("{}", s.continuation_text());
+            }
+        }
+    }
     ExitCode::SUCCESS
 }
 
@@ -177,7 +509,7 @@ fn cmd_encode(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let tok = match Tokenizer::from_merge_file(std::path::Path::new(vocab)) {
+    let tok = match Tokenizer::from_merge_file(Path::new(vocab)) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("vocab: {e}");
@@ -235,7 +567,7 @@ fn cmd_export_expert(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if let Err(err) = save_package(std::path::Path::new(out), &pkg) {
+    if let Err(err) = save_package(Path::new(out), &pkg) {
         eprintln!("write: {err}");
         return ExitCode::from(1);
     }
@@ -252,7 +584,7 @@ fn cmd_install_expert(args: &[String]) -> ExitCode {
         }
     };
     let dir = flag(args, "--dir").unwrap_or("experts");
-    let pkg = match load_package(std::path::Path::new(pack)) {
+    let pkg = match load_package(Path::new(pack)) {
         Ok(p) => p,
         Err(err) => {
             eprintln!("load: {err:?}");
@@ -269,7 +601,7 @@ fn cmd_install_expert(args: &[String]) -> ExitCode {
         eprintln!("incompatible expert");
         return ExitCode::from(1);
     }
-    let dest = std::path::Path::new(dir).join(format!("{}.cxex", pkg.meta.domain));
+    let dest = Path::new(dir).join(format!("{}.cxex", pkg.meta.domain));
     if let Err(err) = save_package(&dest, &pkg) {
         eprintln!("install: {err}");
         return ExitCode::from(1);
@@ -280,7 +612,7 @@ fn cmd_install_expert(args: &[String]) -> ExitCode {
 
 fn cmd_list_experts(args: &[String]) -> ExitCode {
     let dir = flag(args, "--dir").unwrap_or("experts");
-    let found = list_packages(std::path::Path::new(dir));
+    let found = list_packages(Path::new(dir));
     if found.is_empty() {
         println!("experts=0");
         return ExitCode::SUCCESS;
@@ -304,15 +636,22 @@ fn cmd_list_experts(args: &[String]) -> ExitCode {
 }
 
 fn cmd_logits(args: &[String]) -> ExitCode {
-    let model = match require_model(args) {
+    let (model, _) = match require_model(args) {
         Ok(m) => m,
         Err(c) => return c,
     };
-    let ids = flag(args, "--ids").unwrap_or("1");
-    let tokens: Vec<u32> = ids
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
+    let tokens: Vec<u32> = if let Some(prompt) = flag(args, "--prompt") {
+        let tok = match load_tokenizer_arg(args) {
+            Ok(t) => t,
+            Err(c) => return c,
+        };
+        tok.encode(prompt)
+    } else {
+        let ids = flag(args, "--ids").unwrap_or("1");
+        ids.split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    };
     let mut state = model.new_state();
     for (t, id) in tokens.iter().enumerate() {
         let logits = model.step(*id, &mut state);
@@ -322,8 +661,38 @@ fn cmd_logits(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn cmd_check_ctxb(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: cortex-cli --check-ctxb FILE [--prompt TEXT]");
+        return ExitCode::from(2);
+    }
+    let model = match load_ctxb(Path::new(&args[0])) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("load {}: {e}", args[0]);
+            return ExitCode::from(1);
+        }
+    };
+    let prompt = flag(&args[1..], "--prompt").unwrap_or("hello");
+    let tok = Tokenizer::byte_level();
+    let ids = tok.encode(prompt);
+    let mut state = model.new_state();
+    let mut logits = vec![0f32; model.cfg.vocab];
+    if ids.is_empty() {
+        logits = model.step(0, &mut state);
+    } else {
+        for &id in &ids {
+            logits = model.step(id, &mut state);
+        }
+    }
+    for v in logits {
+        println!("{v:.8}");
+    }
+    ExitCode::SUCCESS
+}
+
 fn cmd_status(args: &[String]) -> ExitCode {
-    let model = match require_model(args) {
+    let (model, _) = match require_model(args) {
         Ok(m) => m,
         Err(c) => return c,
     };
@@ -343,34 +712,60 @@ fn cmd_status(args: &[String]) -> ExitCode {
 }
 
 fn cmd_sleep(args: &[String]) -> ExitCode {
-    let mut model = match require_model(args) {
+    let (mut model, model_path) = match require_model(args) {
         Ok(m) => m,
         Err(c) => return c,
     };
-    let path = flag(args, "--model").unwrap();
-    let seqs = vec![vec![1u32, 2, 3, 4], vec![4, 3, 2, 1], vec![1, 1, 2, 2]];
-    let (before, after) = model.mezo_steps(&seqs, 1, 0.05, 0.05, 7);
-    if let Err(e) = save_ctxb(&model, std::path::Path::new(path)) {
-        eprintln!("save after sleep: {e}");
-        return ExitCode::from(1);
+    let steps: usize = flag(args, "--steps")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let eps: f32 = flag(args, "--eps")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1e-4);
+    let lr: f32 = flag(args, "--lr")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5e-6);
+    let seed: u64 = flag(args, "--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
+    let mut fsm = RuntimeFsm::default();
+    match run_sleep_cycle(&mut model, &model_path, steps, eps, lr, seed, &mut fsm) {
+        Ok(s) => {
+            println!(
+                "slept ce {:.6} -> {:.6} wal_eps={} dedup={}+{} snap={:?} fsm={}",
+                s.before,
+                s.after,
+                s.wal_eps,
+                s.dedup_w1,
+                s.dedup_w2,
+                s.snap_ver,
+                fsm.state().as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("sleep: {e}");
+            ExitCode::from(1)
+        }
     }
-    println!("slept ce {before:.6} -> {after:.6}");
-    ExitCode::SUCCESS
 }
 
 fn cmd_reset(args: &[String]) -> ExitCode {
-    let model = match require_model(args) {
+    let (model, model_path) = match require_model(args) {
         Ok(m) => m,
         Err(c) => return c,
     };
-    model.reset_memory_to_init();
-    let path = flag(args, "--model").unwrap();
-    if let Err(e) = save_ctxb(&model, std::path::Path::new(path)) {
-        eprintln!("save after reset: {e}");
-        return ExitCode::from(1);
+    let target_ver: Option<u64> = flag(args, "--version").and_then(|s| s.parse().ok());
+    match run_reset_mem(&model, &model_path, target_ver) {
+        Ok(rb) => {
+            println!("hip_version={} rollback={rb:?}", model.hip_version_sum());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("reset-mem: {e}");
+            ExitCode::from(1)
+        }
     }
-    println!("hip_version={}", model.hip_version_sum());
-    ExitCode::SUCCESS
 }
 
 fn cmd_init_mini(args: &[String]) -> ExitCode {
@@ -381,14 +776,17 @@ fn cmd_init_mini(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let cfg = if flag(args, "--shape") == Some("256") {
-        CortexConfig::test_256()
-    } else if flag(args, "--shape") == Some("tiny") {
-        CortexConfig::mezo_tiny()
-    } else {
-        CortexConfig::mini()
+    let seed: u32 = flag(args, "--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let cfg = match flag(args, "--shape") {
+        Some("256") => CortexConfig::test_256(),
+        Some("micro") => CortexConfig::micro(),
+        Some("tiny") => CortexConfig::mezo_tiny(),
+        Some("step1") => CortexConfig::step1_stories(),
+        _ => CortexConfig::mini(),
     };
-    let model = CortexModel::from_seed(cfg, 1);
+    let model = CortexModel::from_seed(cfg, seed);
     if let Err(e) = save_ctxb(&model, &out) {
         eprintln!("{e}");
         return ExitCode::from(1);
@@ -398,22 +796,22 @@ fn cmd_init_mini(args: &[String]) -> ExitCode {
 }
 
 fn cmd_serve(args: &[String]) -> ExitCode {
-    let model = match require_model(args) {
+    let (model, model_path) = match require_model(args) {
         Ok(m) => m,
         Err(c) => return c,
     };
-    let path = flag(args, "--model").unwrap().to_string();
+    model.attach_wal_dir(&wal_dir_for(&model_path));
     let bind = flag(args, "--bind")
         .unwrap_or("127.0.0.1:43123")
         .to_string();
     let unix = flag(args, "--unix").map(|s| s.to_string());
     let server = cortex_runtime::api::Server {
-        model: std::sync::Arc::new(std::sync::Mutex::new(model)),
-        model_path: PathBuf::from(&path),
+        model: Arc::new(RwLock::new(model)),
+        model_path,
     };
     if let Some(sock) = unix {
         let server = cortex_runtime::api::Server {
-            model: std::sync::Arc::clone(&server.model),
+            model: Arc::clone(&server.model),
             model_path: server.model_path.clone(),
         };
         let sock_path = PathBuf::from(sock);

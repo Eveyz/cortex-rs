@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Step 1 sandbox trainer: ~25M 1.58-bit Cortex on synthetic Chinese stories.
 
-Invoked from tools/train_seed_qat.py --step1. The forward matches the Rust
-CortexModel block order (3 BitSSM + 1 memory block per macro) so the exported
-.ctxb loads in cortex-cli.
-
-No GPU is required. The run is time-boxed and logs the real loss.
+Invoked from `tools/train_seed_qat.py --step1`. Uses the exact numerically
+aligned `CortexSeedModel` (`round_half_away`, `o = S @ q`, per-head INT8 K/V
+sliding-window attention with `WINDOW` mask, L2-normalized hippocampus read,
+`final_norm`, and `CTXB` `flags = 1` export) so PyTorch quantized logits match
+`cortex-cli` within `< 1e-3` even past `WINDOW = 64`.
 """
 
 from __future__ import annotations
@@ -14,11 +14,10 @@ import argparse
 import json
 import os
 import random
-import struct
 import subprocess
 import sys
+import tempfile
 import time
-import zlib
 from pathlib import Path
 
 os.environ.setdefault("OMP_NUM_THREADS", "4")
@@ -26,12 +25,14 @@ os.environ.setdefault("MKL_NUM_THREADS", "4")
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "tools") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tools"))
 
-# 2 macros × 4 layers, d=512, ffn=1120, vocab=4096 → about 25.09M weight entries.
+from train_seed_qat import CortexSeedModel, ModelConfig, export_ctxb  # noqa: E402
+
 N_MACROS = 2
 D = 512
 HEADS = 8
@@ -47,184 +48,13 @@ SEQ = 64
 def weight_matrix_count() -> int:
     emb = VOCAB * D
     ssm = 4 * D * D + (2 * D * FFN + FFN * D) + 2 * D + (2 * HEADS * D + 2 * HEADS)
-    mem = 4 * D * D + D * D + (2 * D * FFN + FFN * D) + 4 * D + 2 * HIP * D
-    return emb + N_MACROS * 3 * ssm + N_MACROS * mem
+    mem = 7 * D * D + (2 * D * FFN + FFN * D) + 4 * D + 2 * HIP * D
+    return emb + N_MACROS * 3 * ssm + N_MACROS * mem + D
 
 
-class BitLinear(nn.Module):
-    """Per-row abs-mean ternary STE. Activations clamp to [-127, 127]."""
-
-    def __init__(self, rows: int, cols: int) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(rows, cols))
-        self.row_scale = nn.Parameter(torch.ones(rows))
-        nn.init.normal_(self.weight, std=0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.weight
-        gamma = w.abs().mean(dim=1, keepdim=True).clamp_min(1e-8)
-        w_q = torch.clamp(torch.round(w / gamma), -1, 1)
-        w_ste = w + (w_q * gamma - w).detach()
-        amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
-        scale = amax / 127.0
-        q = torch.clamp(torch.round(x / scale), -127, 127)
-        x_ste = x + (q * scale - x).detach()
-        return F.linear(x_ste, w_ste) * self.row_scale
-
-    @torch.no_grad()
-    def export_trit(self) -> tuple[np.ndarray, np.ndarray]:
-        w = self.weight.detach()
-        gamma = w.abs().mean(dim=1).clamp_min(1e-8)
-        trit = torch.clamp(torch.round(w / gamma[:, None]), -1, 1).to(torch.int8)
-        scale = (self.row_scale.detach() * gamma).to(torch.float32)
-        return trit.cpu().numpy(), scale.cpu().numpy()
-
-
-def rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    ms = x.pow(2).mean(dim=-1, keepdim=True)
-    return x * torch.rsqrt(ms + EPS) * weight
-
-
-def quant_ste(x: torch.Tensor) -> torch.Tensor:
-    amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
-    scale = amax / 127.0
-    q = torch.clamp(torch.round(x / scale), -127, 127)
-    return x + (q * scale - x).detach()
-
-
-def delta_sequence(q, k, v, alpha, beta) -> torch.Tensor:
-    """q,k,v [B,T,H,Dh]; alpha,beta [B,T,H]. Returns [B,T,H,Dh]."""
-    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    k = k / k.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    bsz, steps, heads, dh = q.shape
-    s = q.new_zeros(bsz, heads, dh, dh)
-    outs = []
-    for t in range(steps):
-        qt, kt, vt = q[:, t], k[:, t], v[:, t]
-        at = alpha[:, t].unsqueeze(-1)
-        bt = beta[:, t].unsqueeze(-1)
-        u = torch.einsum("bhij,bhj->bhi", s, kt)
-        vk = vt - at * u
-        s = at.unsqueeze(-1) * s + bt.unsqueeze(-1) * torch.einsum("bhi,bhj->bhij", vk, kt)
-        outs.append(torch.einsum("bhij,bhi->bhj", s, qt))
-    return torch.stack(outs, dim=1)
-
-
-def ring_attn(q, k, v) -> torch.Tensor:
-    """Causal window attention. q,k,v are [B,T,D] with D = heads * hd."""
-    bsz, steps, _ = q.shape
-    qh = quant_ste(q).view(bsz, steps, HEADS, HD)
-    kh = quant_ste(k).view(bsz, steps, HEADS, HD)
-    vh = quant_ste(v).view(bsz, steps, HEADS, HD)
-    scale = HD**-0.5
-    scores = torch.einsum("bthd,bshd->bhts", qh, kh) * scale
-    mask = torch.triu(torch.ones(steps, steps, device=q.device, dtype=torch.bool), diagonal=1)
-    scores = scores.masked_fill(mask, float("-inf"))
-    attn = torch.softmax(scores, dim=-1)
-    out = torch.einsum("bhts,bshd->bthd", attn, vh)
-    return out.reshape(bsz, steps, HEADS * HD)
-
-
-class SsmBlock(nn.Module):
+class Step1Model(CortexSeedModel):
     def __init__(self) -> None:
-        super().__init__()
-        self.norm1 = nn.Parameter(torch.ones(D))
-        self.norm2 = nn.Parameter(torch.ones(D))
-        self.q = BitLinear(D, D)
-        self.k = BitLinear(D, D)
-        self.v = BitLinear(D, D)
-        self.o = BitLinear(D, D)
-        self.alpha_w = nn.Parameter(torch.zeros(HEADS, D))
-        self.alpha_b = nn.Parameter(torch.zeros(HEADS))
-        self.beta_w = nn.Parameter(torch.zeros(HEADS, D))
-        self.beta_b = nn.Parameter(torch.full((HEADS,), -1.1))
-        self.gate = BitLinear(FFN, D)
-        self.up = BitLinear(FFN, D)
-        self.down = BitLinear(D, FFN)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xn = rmsnorm(x, self.norm1)
-        q, k, v = self.q(xn), self.k(xn), self.v(xn)
-        alpha = torch.sigmoid(xn @ self.alpha_w.T + self.alpha_b)
-        beta = torch.sigmoid(xn @ self.beta_w.T + self.beta_b)
-        o = delta_sequence(
-            q.view(*q.shape[:2], HEADS, HD),
-            k.view(*k.shape[:2], HEADS, HD),
-            v.view(*v.shape[:2], HEADS, HD),
-            alpha,
-            beta,
-        ).reshape_as(q)
-        x = x + self.o(o)
-        xn2 = rmsnorm(x, self.norm2)
-        hidden = F.silu(self.gate(xn2)) * self.up(xn2)
-        return x + self.down(hidden)
-
-
-class MemBlock(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.norm1 = nn.Parameter(torch.ones(D))
-        self.norm2 = nn.Parameter(torch.ones(D))
-        self.wq = BitLinear(D, D)
-        self.wk = BitLinear(D, D)
-        self.wv = BitLinear(D, D)
-        self.wo = BitLinear(D, D)
-        self.hip_proj = BitLinear(D, D)
-        self.w1 = nn.Parameter(torch.empty(HIP, D))
-        self.w2 = nn.Parameter(torch.empty(D, HIP))
-        nn.init.normal_(self.w1, std=1.0 / D**0.5)
-        nn.init.normal_(self.w2, std=0.1 / HIP**0.5)
-        self.gate_w = nn.Parameter(torch.zeros(D))
-        self.gate_b = nn.Parameter(torch.zeros(D))
-        self.fg = BitLinear(FFN, D)
-        self.fu = BitLinear(FFN, D)
-        self.fd = BitLinear(D, FFN)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xn = rmsnorm(x, self.norm1)
-        a = self.wo(ring_attn(self.wq(xn), self.wk(xn), self.wv(xn)))
-        qh = self.hip_proj(xn)
-        m = F.silu(qh @ self.w1.T) @ self.w2.T
-        g = torch.sigmoid(self.gate_w * xn + self.gate_b)
-        y = x + g * a + (1.0 - g) * m
-        yn = rmsnorm(y, self.norm2)
-        hidden = F.silu(self.fg(yn)) * self.fu(yn)
-        return y + self.fd(hidden)
-
-
-class Step1Model(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.embed = nn.Parameter(torch.empty(VOCAB, D))
-        nn.init.normal_(self.embed, std=0.02)
-        self.ssms = nn.ModuleList(SsmBlock() for _ in range(N_MACROS * 3))
-        self.mems = nn.ModuleList(MemBlock() for _ in range(N_MACROS))
-
-    def tied(self) -> torch.Tensor:
-        table = self.embed
-        amax = table.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
-        scale = amax / 127.0
-        q = torch.clamp(torch.round(table / scale), -127, 127)
-        return table + (q * scale - table).detach()
-
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        table = self.tied()
-        x = table[ids]
-        ssm_i = 0
-        for m in range(N_MACROS):
-            for _ in range(3):
-                x = self.ssms[ssm_i](x)
-                ssm_i += 1
-            x = self.mems[m](x)
-        return F.linear(x, table)
-
-    @torch.no_grad()
-    def export_embed(self) -> tuple[np.ndarray, np.ndarray]:
-        table = self.embed.detach()
-        amax = table.abs().amax(dim=1).clamp_min(1e-8)
-        scale = amax / 127.0
-        q = torch.clamp(torch.round(table / scale[:, None]), -127, 127).to(torch.int8)
-        return q.cpu().numpy(), scale.to(torch.float32).cpu().numpy()
+        super().__init__(ModelConfig.step1())
 
 
 def train_bpe(sample: bytes, n_merges: int) -> list[tuple[int, int]]:
@@ -256,7 +86,10 @@ def train_bpe(sample: bytes, n_merges: int) -> list[tuple[int, int]]:
             nxt.append(out)
         seqs = nxt
         if i % 250 == 0 or i + 1 == n_merges:
-            print(f"bpe {i + 1}/{n_merges} pair=({a},{b}) elapsed={time.time() - t0:.1f}s", flush=True)
+            print(
+                f"bpe {i + 1}/{n_merges} pair=({a},{b}) elapsed={time.time() - t0:.1f}s",
+                flush=True,
+            )
     return merges
 
 
@@ -270,105 +103,6 @@ def sample_bytes_for_bpe(text: str, limit: int) -> bytes:
         if len(buf) + len(raw) > limit:
             break
         buf.extend(raw)
-    return bytes(buf)
-
-
-def pack_ternary(trit: np.ndarray) -> tuple[int, int, int, int, bytes]:
-    rows, cols = trit.shape
-    rows_pad = (rows + 15) // 16 * 16
-    cols_pad = (cols + 15) // 16 * 16
-    nrg = rows_pad // 16
-    ncb = cols_pad // 16
-    blocks = bytearray(nrg * ncb * 64)
-    for r in range(rows):
-        for c in range(cols):
-            w = int(trit[r, c])
-            code = {0: 0, 1: 0b01, -1: 0b11}[w]
-            rg, cb = r // 16, c // 16
-            tile = (c % 16) // 4
-            off = (rg * ncb + cb) * 64 + tile * 16 + (r % 16)
-            blocks[off] |= code << (2 * (c % 4))
-    return rows, cols, rows_pad, cols_pad, bytes(blocks)
-
-
-def _u32(buf: bytearray, v: int) -> None:
-    buf.extend(struct.pack("<I", int(v)))
-
-
-def _u64(buf: bytearray, v: int) -> None:
-    buf.extend(struct.pack("<Q", int(v)))
-
-
-def _f32s(buf: bytearray, xs) -> None:
-    arr = np.asarray(xs, dtype=np.float32).reshape(-1)
-    buf.extend(arr.tobytes())
-
-
-def _pad64(buf: bytearray) -> None:
-    while len(buf) % 64:
-        buf.append(0)
-
-
-def _write_bit(buf: bytearray, layer: BitLinear) -> None:
-    trit, scale = layer.export_trit()
-    rows, cols, rows_pad, cols_pad, raw = pack_ternary(trit)
-    _u32(buf, rows)
-    _u32(buf, cols)
-    _u32(buf, rows_pad)
-    _u32(buf, cols_pad)
-    _pad64(buf)
-    buf.extend(raw)
-    _f32s(buf, scale)
-
-
-def export_ctxb(model: Step1Model) -> bytes:
-    emb, emb_scale = model.export_embed()
-    buf = bytearray()
-    buf.extend(b"CTXB")
-    _u32(buf, 1)
-    _u32(buf, N_MACROS)
-    _u32(buf, D)
-    _u32(buf, HEADS)
-    _u32(buf, HD)
-    _u32(buf, VOCAB)
-    _u32(buf, WINDOW)
-    _u32(buf, FFN)
-    _u32(buf, HIP)
-    _f32s(buf, np.array([EPS], np.float32))
-    _u32(buf, 0)
-    _pad64(buf)
-    buf.extend(np.asarray(emb, dtype=np.int8).tobytes())
-    _f32s(buf, emb_scale)
-    ssm_i = 0
-    for _m in range(N_MACROS):
-        for _s in range(3):
-            layer = model.ssms[ssm_i]
-            ssm_i += 1
-            _f32s(buf, layer.norm1.detach().cpu().numpy())
-            _f32s(buf, layer.norm2.detach().cpu().numpy())
-            _f32s(buf, layer.alpha_w.detach().cpu().numpy())
-            _f32s(buf, layer.alpha_b.detach().cpu().numpy())
-            _f32s(buf, layer.beta_w.detach().cpu().numpy())
-            _f32s(buf, layer.beta_b.detach().cpu().numpy())
-            for bit in (layer.q, layer.k, layer.v, layer.o, layer.gate, layer.up, layer.down):
-                _write_bit(buf, bit)
-        mem = model.mems[_m]
-        _f32s(buf, mem.norm1.detach().cpu().numpy())
-        _f32s(buf, mem.norm2.detach().cpu().numpy())
-        _f32s(buf, mem.gate_w.detach().cpu().numpy())
-        _f32s(buf, mem.gate_b.detach().cpu().numpy())
-        for bit in (mem.wq, mem.wk, mem.wv, mem.wo, mem.hip_proj):
-            _write_bit(buf, bit)
-        _u32(buf, D)
-        _u32(buf, HIP)
-        _u32(buf, D)
-        _u64(buf, 0)
-        _f32s(buf, mem.w1.detach().cpu().numpy())
-        _f32s(buf, mem.w2.detach().cpu().numpy())
-        for bit in (mem.fg, mem.fu, mem.fd):
-            _write_bit(buf, bit)
-    crc = zlib.crc32(bytes(buf)) & 0xFFFFFFFF
-    _u32(buf, crc)
     return bytes(buf)
 
 
@@ -386,7 +120,14 @@ def ensure_corpus(path: Path, nbytes: int) -> None:
         print(f"corpus exists {path} ({path.stat().st_size} bytes)")
         return
     subprocess.check_call(
-        [sys.executable, str(ROOT / "tools/make_step1_stories.py"), "--out", str(path), "--bytes", str(nbytes)]
+        [
+            sys.executable,
+            str(ROOT / "tools/make_step1_stories.py"),
+            "--out",
+            str(path),
+            "--bytes",
+            str(nbytes),
+        ]
     )
 
 
@@ -396,17 +137,64 @@ def ensure_tokens(corpus: Path, merges: Path, tokens: Path, rust: Path, bpe_byte
         sample = sample_bytes_for_bpe(text, bpe_bytes)
         print(f"training BPE on {len(sample)} bytes toward vocab {VOCAB}")
         pairs = train_bpe(sample, VOCAB - 256)
+        merges.parent.mkdir(parents=True, exist_ok=True)
         merges.write_text("".join(f"{a} {b}\n" for a, b in pairs), encoding="utf-8")
         print(f"wrote {merges} ({len(pairs)} merges, vocab {256 + len(pairs)})")
     if tokens.exists() and tokens.stat().st_size > 0:
         print(f"tokens exist {tokens}")
         return
+    tokens.parent.mkdir(parents=True, exist_ok=True)
     print("encoding corpus with cortex-cli")
     t0 = time.time()
     subprocess.check_call(
-        [str(rust), "encode", "--vocab", str(merges), "--input", str(corpus), "--output", str(tokens)]
+        [
+            str(rust),
+            "encode",
+            "--vocab",
+            str(merges),
+            "--input",
+            str(corpus),
+            "--output",
+            str(tokens),
+        ]
     )
     print(f"encode wall {time.time() - t0:.1f}s")
+
+
+def self_check_step1(rust: Path) -> None:
+    """Verify Step1Model (`25.9M`, `d=512`, `vocab=4096`) matches Rust `< 1e-3`."""
+    torch.manual_seed(21)
+    model = Step1Model()
+    model.eval()
+    tokens = [(i * 37 + 11) % VOCAB for i in range(8)]
+    py_rows = model.quantized_logits_seq(tokens)
+    blob = export_ctxb(model)
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "step1_probe.ctxb"
+        p.write_bytes(blob)
+        proc = subprocess.run(
+            [str(rust), "logits", "--model", str(p), "--ids", ",".join(map(str, tokens))],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if proc.returncode != 0:
+        raise SystemExit(f"cortex-cli logits failed: {proc.stderr}")
+    rs_rows = [
+        np.array([float(v) for v in ln.split()[2:]], dtype=np.float32)
+        for ln in proc.stdout.splitlines()
+        if ln.startswith("pos=")
+    ]
+    if len(rs_rows) != len(tokens):
+        raise SystemExit(f"row mismatch {len(rs_rows)} != {len(tokens)}")
+    worst = max(
+        float(np.max(np.abs(a.astype(np.float64) - b.astype(np.float64))))
+        for a, b in zip(py_rows, rs_rows)
+    )
+    print(f"step1 self-check ({len(tokens)} steps, d={D}, vocab={VOCAB}): max abs logit err = {worst:.3e}")
+    if worst >= 1e-3:
+        raise SystemExit(f"step1 self-check failed: {worst:.3e} >= 1e-3")
+    print("step1 self-check ok")
 
 
 def train(args: argparse.Namespace) -> None:
@@ -443,7 +231,7 @@ def train(args: argparse.Namespace) -> None:
         starts = rng.integers(0, len(token_arr) - SEQ, size=args.batch)
         batch = np.stack([token_arr[s : s + SEQ] for s in starts]).astype(np.int64)
         ids = torch.from_numpy(batch)
-        logits = model(ids)
+        logits = model(ids, training=True)
         loss = F.cross_entropy(logits[:, :-1].reshape(-1, VOCAB), ids[:, 1:].reshape(-1))
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -508,7 +296,11 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=21)
     p.add_argument("--rust-bin", default=None)
     p.add_argument("--probe", action="store_true", help="one step then exit")
+    p.add_argument("--self-check", action="store_true", help="check PyTorch vs Rust past window=64")
     args = p.parse_args()
+    if args.self_check:
+        self_check_step1(rust_bin(args.rust_bin))
+        return
     if args.probe:
         args.minutes = 10**9
         args.max_steps = 1

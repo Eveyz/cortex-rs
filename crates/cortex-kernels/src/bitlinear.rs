@@ -40,14 +40,7 @@ pub fn quantize_activations_sym_i8(x: &[f32]) -> (Vec<i8>, f32) {
                 return 0i8;
             }
             let r = round_half_away(v / scale);
-            let c = if r > 127.0 {
-                127.0
-            } else if r < -127.0 {
-                -127.0
-            } else {
-                r
-            };
-            c as i8
+            r.clamp(-127.0, 127.0) as i8
         })
         .collect();
     (q, scale)
@@ -59,14 +52,7 @@ pub fn quantize_with_scale(x: &[f32], scale: f32) -> Vec<i8> {
     x.iter()
         .map(|v| {
             let r = round_half_away(v / scale);
-            let c = if r > 127.0 {
-                127.0
-            } else if r < -127.0 {
-                -127.0
-            } else {
-                r
-            };
-            c as i8
+            r.clamp(-127.0, 127.0) as i8
         })
         .collect()
 }
@@ -166,17 +152,33 @@ impl BitLinearWeights {
     }
 
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
-        self.forward_with(x, false)
+        let mut out = vec![0.0f32; self.rows];
+        self.forward_into(x, &mut out);
+        out
+    }
+
+    /// Alias matching `cortex-muse` ergonomics (`y = W @ x`, written into `out`).
+    #[inline]
+    pub fn forward_gemv(&self, x: &[f32], out: &mut [f32]) {
+        self.forward_into(x, out);
+    }
+
+    pub fn forward_into(&self, x: &[f32], out: &mut [f32]) {
+        self.forward_into_with(x, out, false);
     }
 
     pub fn forward_scalar(&self, x: &[f32]) -> Vec<f32> {
-        self.forward_with(x, true)
+        let mut out = vec![0.0f32; self.rows];
+        self.forward_into_with(x, &mut out, true);
+        out
     }
 
-    fn forward_with(&self, x: &[f32], force_scalar: bool) -> Vec<f32> {
+    fn forward_into_with(&self, x: &[f32], out: &mut [f32], force_scalar: bool) {
         assert_eq!(x.len(), self.cols, "bitlinear k-dim");
+        assert_eq!(out.len(), self.rows, "bitlinear out-dim");
         if self.rows == 0 || self.cols == 0 {
-            return vec![0.0; self.rows];
+            out.fill(0.0);
+            return;
         }
         let (q, x_scale) = quantize_activations_sym_i8(x);
         let mut qpad = vec![0i8; self.cols_pad];
@@ -188,9 +190,9 @@ impl BitLinearWeights {
             gemv_bit158(&self.blocks, &qpad, &mut acc, self.rows_pad, self.cols_pad);
         }
         let scales = self.row_scales.as_slice();
-        (0..self.rows)
-            .map(|r| acc[r] as f32 * x_scale * scales[r])
-            .collect()
+        for r in 0..self.rows {
+            out[r] = acc[r] as f32 * x_scale * scales[r];
+        }
     }
 }
 

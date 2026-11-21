@@ -1,16 +1,16 @@
-//! In-place 3-pass MeZO.
+//! In-place zero-copy 3-pass MeZO (`MezoScaleTuner` & `mezo_3pass`).
 //!
-//! Given seed `s` and Rademacher `z_i = rademacher(s, i)`:
+//! Given deterministic seed `s` and stateless Rademacher `z_i = rademacher(s, i)`:
+//! 1. `φ ← φ + ε z`, measure `L+` (forward #1)
+//! 2. `φ ← φ - 2 ε z`, measure `L-` (forward #2, evaluated at `φ_0 - ε z`)
+//! 3. `φ ← φ + (ε - Δ) z` where `Δ = clamp(lr * (L+ - L-) / (2ε), -max_step, max_step)`
+//!    restores `φ_0` and applies the projected gradient step in one pass.
 //!
-//! 1. `θ ← θ + ε z`, measure `L+`
-//! 2. `θ ← θ - 2 ε z`, measure `L-`  (now at `θ_0 - ε z`)
-//! 3. `θ ← θ + (ε - lr * (L+ - L-) / (2ε)) z`
-//!    which lands on `θ_0 - lr * (L+ - L-) / (2ε) * z`
-//!
-//! Pass 3 both restores the probe and applies the update, so `z` is never
-//! stored.
+//! Zero copies of `φ` or `z` are ever allocated, and each step runs **strictly
+//! two pure forward passes** with zero autograd graph.
 
-/// Stateless ±1 from `(seed, index)`. Same seed regenerates the same `z`.
+/// Stateless ±1 from `(seed, index)` via SplitMix64. Same seed regenerates the exact `z`.
+#[inline]
 pub fn rademacher(seed: u64, index: usize) -> f32 {
     let mut x = seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
     x ^= x >> 30;
@@ -25,13 +25,13 @@ pub fn rademacher(seed: u64, index: usize) -> f32 {
     }
 }
 
-/// Something MeZO can perturb in place and score with a scalar loss.
+/// Trait implemented by models whose continuous scales `φ` can be perturbed in place.
 pub trait InPlacePhi {
     fn apply_z(&mut self, seed: u64, scale: f32);
     fn loss(&mut self) -> f32;
 }
 
-/// One MeZO step. Returns `(L+, L-)`.
+/// One unclipped 3-pass MeZO step. Calls `model.loss()` **exactly twice**. Returns `(L+, L-)`.
 pub fn mezo_3pass(model: &mut impl InPlacePhi, seed: u64, eps: f32, lr: f32) -> (f32, f32) {
     assert!(eps > 0.0, "MeZO epsilon must be positive");
     model.apply_z(seed, eps);
@@ -39,9 +39,66 @@ pub fn mezo_3pass(model: &mut impl InPlacePhi, seed: u64, eps: f32, lr: f32) -> 
     model.apply_z(seed, -2.0 * eps);
     let lm = model.loss();
     let coeff = (lp - lm) / (2.0 * eps);
-    // From θ0 - εz, add (ε - lr*coeff) z → θ0 - lr*coeff z.
     model.apply_z(seed, eps - lr * coeff);
     (lp, lm)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MezoStepReport {
+    pub loss_plus: f32,
+    pub loss_minus: f32,
+    pub g_proj: f32,
+}
+
+/// Stateful zero-copy MeZO scale tuner with optional scalar step clipping
+/// (prevents high-variance projected gradients from collapsing small row scales
+/// while maintaining zero extra parameter buffers and 2 forwards per step).
+#[derive(Clone, Debug)]
+pub struct MezoScaleTuner {
+    pub eps: f32,
+    pub lr: f32,
+    pub base_seed: u64,
+    pub steps_done: u64,
+    pub max_step: Option<f32>,
+}
+
+impl MezoScaleTuner {
+    pub fn new(eps: f32, lr: f32, base_seed: u64) -> Self {
+        Self {
+            eps,
+            lr,
+            base_seed,
+            steps_done: 0,
+            max_step: None,
+        }
+    }
+
+    pub fn with_max_step(mut self, max_step: f32) -> Self {
+        self.max_step = Some(max_step);
+        self
+    }
+
+    /// Execute one in-place MeZO step on `model` (strictly 2 forward passes, 0 clones).
+    pub fn step_in_place(&mut self, model: &mut impl InPlacePhi) -> MezoStepReport {
+        assert!(self.eps > 0.0, "MeZO epsilon must be positive");
+        let seed = self.base_seed.wrapping_add(self.steps_done);
+        model.apply_z(seed, self.eps);
+        let lp = model.loss();
+        model.apply_z(seed, -2.0 * self.eps);
+        let lm = model.loss();
+        let g_proj = (lp - lm) / (2.0 * self.eps);
+        let mut delta = self.lr * g_proj;
+        if let Some(cap) = self.max_step {
+            delta = delta.clamp(-cap, cap);
+        }
+        model.apply_z(seed, self.eps - delta);
+        self.steps_done += 1;
+        MezoStepReport {
+            loss_plus: lp,
+            loss_minus: lm,
+            g_proj,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -51,6 +108,7 @@ mod tests {
     struct Bowl {
         phi: Vec<f32>,
         target: Vec<f32>,
+        forwards: usize,
     }
 
     impl InPlacePhi for Bowl {
@@ -60,6 +118,7 @@ mod tests {
             }
         }
         fn loss(&mut self) -> f32 {
+            self.forwards += 1;
             self.phi
                 .iter()
                 .zip(self.target.iter())
@@ -84,19 +143,19 @@ mod tests {
     }
 
     #[test]
-    fn quadratic_bowl_descends_without_a_gradient_buffer() {
+    fn quadratic_bowl_descends_in_strictly_two_forwards_per_step() {
         let mut bowl = Bowl {
             phi: vec![0.0; 8],
             target: vec![0.5, -0.25, 0.1, 0.0, 0.3, -0.4, 0.2, -0.1],
+            forwards: 0,
         };
         let l0 = bowl.loss();
-        let mut seed = 7u64;
-        // Small step size: one-sample MeZO on 8 coordinates is noisy, and the
-        // quadratic Hessian is 2, so a large lr diverges.
+        bowl.forwards = 0;
+        let mut tuner = MezoScaleTuner::new(0.05, 0.02, 7).with_max_step(0.05);
         for _ in 0..80 {
-            mezo_3pass(&mut bowl, seed, 0.05, 0.02);
-            seed = seed.wrapping_add(1);
+            tuner.step_in_place(&mut bowl);
         }
+        assert_eq!(bowl.forwards, 160, "strictly 2 forward passes per step");
         let l1 = bowl.loss();
         assert!(l1 < l0 * 0.5, "quadratic MeZO {l0} -> {l1}");
     }

@@ -256,7 +256,7 @@ mod tests {
         // Single +1 at (row=3, col=2) inside the first tile => bits 5..4 of data[3].
         let mut w = vec![0i8; 16 * 16];
         w[3 * 16 + 2] = 1;
-        w[3 * 16 + 0] = -1;
+        w[3 * 16] = -1;
         let packed = pack_ternary(&w, 16, 16).unwrap();
         let byte = packed.blocks[0].tiles[0].data[3];
         assert_eq!((byte >> 4) & 0b11, 0b01, "w[3,2] lives in bits 5..4");

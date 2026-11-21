@@ -1,89 +1,46 @@
-# Spec mapping
+# Spec Mapping (`Cortex-Local` Unified Architecture)
 
-This tree follows the superseding implementation brief. Earlier notes (pure-Rust
-kernels, the hippocampus arena, the data-mix addendum) were adapted where they
-disagreed with that brief. There is no C toolchain and no autograd inside
-`crates/`.
+This repository implements **Cortex-Local** across 5 pure-Rust crates (`crates/`, zero external ML frameworks, zero runtime autograd, zero `cc` build scripts) and an offline PyTorch QAT + distillation toolchain (`tools/`).
 
-## Crates
+## 1. Crate & Tool Mapping
 
-| Brief piece | Code |
+| Design Contract | Implementation |
 | --- | --- |
-| 1.58-bit tiles, INT8 activations, scalar / AVX2 / NEON GEMV | `crates/cortex-kernels` |
-| `Tile16x4` bit order `7..6 = w[r,3]` … `1..0 = w[r,0]`; codes `00/01/11` | `crates/cortex-kernels/src/tile.rs` |
-| `CacheLine16x16` = 4 tiles, `align(64)` | `tile.rs` |
-| Symmetric INT8 in `[-127, 127]`, promote `i16→i32` every 8 cache lines | `gemv.rs`, `bitlinear.rs` |
-| Gated DeltaNet rank-1 update, state `[heads, d, d]` | `crates/cortex-ssm/src/deltanet.rs` |
-| BitSSM block (layers 1–3): BitLinear QKV + DeltaNet + Bit SwiGLU | `crates/cortex-ssm/src/block.rs` |
-| INT8 ring window attention (branch A, window 512 in the prod config) | `crates/cortex-ssm/src/ring_attn.rs` |
-| Hippocampus `m = W2 SiLU(W1 q)`, `W2` init × 0.1 | `crates/cortex-hippocampus/src/mlp.rs` |
-| `Surprise = (1/(2d)) ‖m − v‖²`, drop / local / high | `surprise.rs`, `lib.rs` `inject` |
-| `SharedWeightArena`: two `UnsafeCell` slots, `active_idx`, `active_readers[2]` | `arena.rs` |
-| WAL + mmap snapshot rollback | `wal.rs` (`memmap2`) |
-| MeZO 3-pass, one PRNG seed, φ = row scales + RMS weights | `crates/cortex-sleep/src/mezo.rs` |
-| Replay 80% WAL / 20% anchors | `crates/cortex-sleep/src/replay.rs` |
-| Macro model, tied INT8 embedding / LM head | `crates/cortex-runtime/src/model.rs` |
-| `.ctxb` (magic `CTXB`, CRC32, packed tiles) | `ctxb.rs` |
-| Byte-fallback BPE, default 256-byte vocab | `tokenizer.rs` |
-| Temperature, top-p, repetition penalty | `sample.rs` |
-| `cortex-cli` `/status` `/sleep` `/reset-mem`, streaming generate | `main.rs`, `generate.rs` |
-| Local HTTP + Unix socket | `api.rs` |
-| QAT STE, joint hippocampus, `export_to_ctxb`, logit self-check | `tools/train_seed_qat.py` |
-| Step 1 measured 25.1M run | `tools/step1_train.py`, `docs/step1.md` |
-| Step 2/3 manifests and the three cleaners | `tools/prepare_corpus.py`, `configs/` |
-| Qwen3-28B distill scaffold (mock teacher by default) | `tools/distill_qwen.py` |
-| L2 experts, packages, router | `crates/cortex-runtime/src/expert.rs` |
-| L3 verified traces | `crates/cortex-runtime/src/traces.rs`, `tools/traces.py` |
-| Tool harness and constrained JSON | `harness.rs`, `grammar.rs` |
-| Family presets Nano / Pro / Max | `crates/cortex-runtime/src/family.rs` |
-| Instruction and tool manifests, DPO/GRPO scaffolds | `tools/align_recipes.py`, `configs/` |
+| 1.58-bit `Tile16x4` (16B) & `CacheLine16x16` (`align(64)`, 64B), codes `00->0, 01->+1, 11->-1` | `crates/cortex-kernels/src/tile.rs` |
+| Symmetric INT8 dynamic activation quantization in `[-127, +127]` (`round_half_away`, never `-128`) | `crates/cortex-kernels/src/bitlinear.rs` |
+| Multiplication-free SIMD GEMV (`x86_64` AVX2 `_mm256_shuffle_epi8` + `_mm256_sign_epi8`, `aarch64` NEON `vqtbl1q_u8` + `vaddl_s8`), `i16 -> i32` promotion every 8 cache lines (128 cols), single row-tail FP32 dequant | `crates/cortex-kernels/src/gemv.rs`, `bitlinear.rs` |
+| `O(d_head^2)` Gated DeltaNet rank-1 recurrence (`u = S k`, `S = α S + β(v - α u) k^T`, `o = S q`) + WY lower-triangular chunkwise prefill (`Γ < 1e-3` sequential fallback) | `crates/cortex-ssm/src/deltanet.rs`, `block.rs` |
+| Constant-capacity INT8 sliding-window ring attention (`W = 512`, `O(1)` memory over 10,000+ tokens) | `crates/cortex-ssm/src/ring_attn.rs` |
+| Online neural hippocampus `m = W2 SiLU(W1 L2Norm(q))`, `0.1×` `W2` cold-start init, L2-normalized `q_t`/`k_t`, analytic outer-product momentum SGD | `crates/cortex-hippocampus/src/mlp.rs` |
+| Lock-free double-buffered `SharedWeightArena` with Dekker `SeqCst` reader drain guard + background `AsyncHippocampusHandle` (`PlasticityWorker`) | `crates/cortex-hippocampus/src/arena.rs`, `lib.rs` |
+| 3-band surprise gate (`Drop` / `Local` / `High` boosted LR + `WAL1` CRC32 episode log + torn-tail crash recovery + `HPSP` mmap snapshot rollback) | `crates/cortex-hippocampus/src/surprise.rs`, `wal.rs` |
+| Zero-copy in-place 3-pass MeZO (`+ε z -> -2ε z -> restore & step`, 2 forwards/step, 0 parameter clones), 80% WAL + 20% anchor `ReplayBuffer`, Gram–Schmidt row orthogonalization & singular suppression | `crates/cortex-sleep/src/mezo.rs`, `replay.rs`, `orthogonalize.rs` |
+| Macro-cycle `CortexModel` (`3 × BitSSM + 1 × MemoryBlock`), weight-tied INT8 embedding / LM head, `final_norm`, `.ctxb` (`CTXB`, 64B-aligned tiles, IEEE CRC32) | `crates/cortex-runtime/src/model.rs`, `ctxb.rs` |
+| Lossless UTF-8 byte-fallback BPE + 10 dense collision-free atomic control tokens (`<|im_start|>`, `<|thought|>`, `<|tool_call|>`, etc.) | `crates/cortex-runtime/src/tokenizer.rs` |
+| Constrained JSON Grammar FSM (`ToolCallFsm::mask_logits`), stop-token truncation, sandboxed 5-tool `AgentLoop`, day/night `RuntimeFsm`, `RwLock` concurrent HTTP/Unix server | `crates/cortex-runtime/src/grammar.rs`, `tools.rs`, `fsm.rs`, `generate.rs`, `api.rs`, `main.rs` |
+| L2 sparse micro-expert packages (`.cxex`) & router + Nano/Pro/Max family configs + L3 verified trace cleaner | `crates/cortex-runtime/src/expert.rs`, `family.rs`, `traces.rs`, `docs/l3-self-distillation.md` |
+| Offline STE QAT + joint hippocampus read/write meta-training + `.ctxb` exporter + `< 1e-3` Rust logit parity check | `tools/train_seed_qat.py`, `tools/test_ctxb_packing.py`, `tools/step1_train.py` |
+| Qwen3 teacher data generation (7 categories incl. 50/20/15/15 tool-use verification), `-100` prompt-masked SFT distillation, DPO/SimPO/GRPO/RLVR recipes | `tools/distill_generate.py`, `tools/distill_train.py`, `tools/distill_qwen.py`, `tools/align_recipes.py`, `tools/test_tooluse_generators.py` |
 
-## Recurrence actually implemented
+## 2. Gated DeltaNet Orientation & Complexity
 
-After per-head L2-normalization of `q` and `k`:
+With per-head L2-normalized `q_t` and `k_t` and state `S` stored row-major as `[d_v, d_k]` (`d_v = d_k = d_head`):
 
 ```text
-u = S_{t-1} k_t
-S_t = α_t S_{t-1} + β_t (v_t − α_t u) k_t^T
-o_t = S_t^T q_t
+u_t = S_{t-1} k_t                                  -- O(d_head^2)
+S_t = α_t S_{t-1} + β_t (v_t - α_t u_t) k_t^T     -- O(d_head^2) rank-1 outer product
+o_t = S_t q_t                                      -- O(d_head^2)
 ```
 
-which is the same as
+No `I - β_t k_t k_t^T` dense matrix-matrix product (`O(d_head^3)`) is ever formed. Under `β_t = 1` from `S_0 = 0`, `S_1 = v_1 k_1^T` and querying `q_1 = k_1` with `||k_1||_2 = 1` yields `o_1 = (v_1 k_1^T) k_1 = v_1` exactly.
 
-```text
-S_t = α_t S_{t-1} (I − β_t k_t k_t^T) + β_t v_t k_t^T
-```
+## 3. Model Presets
 
-`α` and `β` are per-head sigmoids of a light FP32 projection. `q, k, v, o`
-are `BitLinearWeights`. State is caller-owned and does not grow with `T`.
-
-## Macro cycle
-
-| Config | Macros | Layers | d_model | Window |
-| --- | --- | --- | --- | --- |
-| `CortexConfig::prod` | 6 | 24 | 2048 | 512 |
-| `CortexConfig::test_256` | 2 | 8 | 256 | 512 |
-| `CortexConfig::mezo_tiny` | 2 | 8 | 32 | 8 |
-| `CortexConfig::mini` | 1 | 4 | 16 | 8 |
-
-Layer 4 of each macro is branch A (INT8 ring) + branch B (hippocampus read of a
-BitLinear query) added through a diagonal sigmoid gate, then a 1.58-bit SwiGLU.
-The prod shape is a config constant. Tests do not allocate it.
-
-## DoD tests
-
-| Test | Where |
-| --- | --- |
-| `test_simd_bitexact` (37×523, err < 1e-5) | `cortex-kernels` |
-| `test_deltanet_constant_memory` (2048 steps) | `cortex-ssm` |
-| `test_oneshot_hippocampus_binding` (MSE drop > 80%, repeat does not bump version) | `cortex-hippocampus` |
-| `test_mezo_loss_descent` (8-layer probe, 30 steps) | `cortex-runtime` |
-| `test_end_to_end_cli_generation` (32 streamed tokens, latency + RSS) | `cortex-runtime/tests/e2e.rs` |
-
-## Explicitly not in this tree
-
-* A trained 1.6B or 120M checkpoint, and any downloaded corpus.
-* A 32,768-token trained BPE. The tokenizer is byte-level plus optional merges.
-* GPU kernels, autograd, or a Python runtime on the inference path.
-* Measured throughput of the production shape. Numbers in the README, if any,
-  are for the mini model on the machine that ran them.
+| Preset | Macros | Layers | `d_model` | Heads × `d_head` | Vocab | Window |
+| --- | --- | --- | --- | --- | --- | --- |
+| `CortexConfig::prod` | 6 | 24 | 2048 | 32 × 64 | 32768 | 512 |
+| `CortexConfig::step1_stories` | 2 | 8 | 512 | 8 × 64 | 4096 | 64 |
+| `CortexConfig::micro` | 2 | 8 | 256 | 4 × 64 | 266 | 512 |
+| `CortexConfig::test_256` | 2 | 8 | 256 | 8 × 32 | 266 | 512 |
+| `CortexConfig::mezo_tiny` | 2 | 8 | 32 | 4 × 8 | 16 | 8 |
+| `CortexConfig::mini` | 1 | 4 | 16 | 2 × 8 | 32 | 8 |

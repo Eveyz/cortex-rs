@@ -1,45 +1,38 @@
-//! Multiply-free ternary GEMV.
+//! Multiply-free 1.58-bit ternary GEMV microkernels.
 //!
-//! Activations are symmetric INT8 in `[-127, +127]` (never `-128`, so
-//! `0i8 - x` cannot overflow `i8`). The accumulator is `i16` inside a
-//! cache-line tile and is promoted into `i32` after every 8 cache-line
-//! blocks (128 columns). Worst case inside one bucket is `128 * 127 = 16256`,
-//! about 2× headroom under `i16::MAX`.
+//! Activations are symmetric INT8 in `[-127, +127]` (never `-128`, so negation
+//! `0i8 - x` cannot overflow `i8`). Each [`CacheLine16x16`] holds 16 output rows
+//! × 16 input columns (four [`Tile16x4`]s). Inside the K loop, 16-row `i16`
+//! accumulators collect exact sums and promote losslessly into `i32` every
+//! 8 cache-line blocks (128 columns; worst-case magnitude `128 * 127 = 16_256`
+//! has 2× headroom under `i16::MAX = 32_767`).
 //!
-//! Dequantization is **not** done here. Callers scale the `i32` row sum once.
+//! Hardware paths:
+//! * **AVX2 (`x86_64` / `x86`)**: packs column pairs into 256-bit lanes, decodes
+//!   2-bit trits via `_mm256_shuffle_epi8` + `_mm256_sign_epi8` (zero float or
+//!   integer multiplications), accumulates in `i16x16`, widens to `i32` every
+//!   128 columns.
+//! * **NEON (`aarch64`)**: decodes 2-bit trits via `vqtbl1q_u8` LUT masks and
+//!   uses dual-column `vaddl_s8` / `vaddl_high_s8` wide-adds into `i16x8` halves,
+//!   widening to `i32x4` registers every 128 columns.
+//! * **Scalar**: portable bit-exact reference.
+//!
+//! Dequantization is **not** done here; callers apply `x_scale * row_scale[r]`
+//! once per output row at the end.
 
-use crate::tile::CacheLine16x16;
-
-/// Compile-time sign LUTs for `vpshufb`. Index is the 2-bit code.
-/// `01 -> 0xFF` (add), `11 -> 0xFF` (subtract on the other table). `10` stays 0.
-#[repr(C, align(16))]
-struct AlignedLut([u8; 16]);
-
-static ADD_LUT: AlignedLut =
-    AlignedLut([0x00, 0xFF, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-static SUB_LUT: AlignedLut =
-    AlignedLut([0x00, 0x00, 0x00, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+use crate::tile::{CacheLine16x16, Tile16x4};
 
 #[inline]
-fn sat_add(a: i16, b: i16) -> i16 {
-    a.saturating_add(b)
-}
-
-#[inline]
-fn sat_sub(a: i16, b: i16) -> i16 {
-    a.saturating_sub(b)
-}
-
-fn accum_tile_scalar(tile: &crate::tile::Tile16x4, x: &[i8], base: usize, acc: &mut [i16; 16]) {
+fn accum_tile_scalar(tile: &Tile16x4, x: &[i8], base: usize, acc: &mut [i16; 16]) {
     for r in 0..16 {
         let byte = tile.data[r];
         let mut a = acc[r];
         for c in 0..4 {
             let code = (byte >> (2 * c)) & 0b11;
-            let xv = x[base + c] as i16;
+            let xv = i16::from(x[base + c]);
             match code {
-                0b01 => a = sat_add(a, xv),
-                0b11 => a = sat_sub(a, xv),
+                0b01 => a += xv,
+                0b11 => a -= xv,
                 _ => {}
             }
         }
@@ -58,17 +51,6 @@ pub fn gemv_bit158_scalar(
     rows_pad: usize,
     cols_pad: usize,
 ) {
-    gemv_with(blocks, x, y, rows_pad, cols_pad, accum_tile_scalar);
-}
-
-fn gemv_with(
-    blocks: &[CacheLine16x16],
-    x: &[i8],
-    y: &mut [i32],
-    rows_pad: usize,
-    cols_pad: usize,
-    mut tile_fn: impl FnMut(&crate::tile::Tile16x4, &[i8], usize, &mut [i16; 16]),
-) {
     assert!(rows_pad % 16 == 0 && cols_pad % 16 == 0, "padded shape");
     assert_eq!(x.len(), cols_pad);
     assert!(y.len() >= rows_pad);
@@ -82,7 +64,7 @@ fn gemv_with(
             let block = &blocks[rg * ncb + cb];
             for t in 0..4 {
                 let col = cb * 16 + t * 4;
-                tile_fn(&block.tiles[t], x, col, &mut acc16);
+                accum_tile_scalar(&block.tiles[t], x, col, &mut acc16);
             }
             // Promote every 8 cache lines (128 K) and on the tail.
             if (cb + 1) % 8 == 0 || cb + 1 == ncb {
@@ -93,9 +75,7 @@ fn gemv_with(
             }
         }
         let base = rg * 16;
-        for r in 0..16 {
-            y[base + r] = acc32[r];
-        }
+        y[base..base + 16].copy_from_slice(&acc32);
     }
 }
 
@@ -125,7 +105,7 @@ pub fn gemv_bit158(
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2,ssse3")]
+#[target_feature(enable = "avx2")]
 pub unsafe fn gemv_bit158_avx2(
     blocks: &[CacheLine16x16],
     x: &[i8],
@@ -145,60 +125,68 @@ pub unsafe fn gemv_bit158_avx2(
     let ncb = cols_pad / 16;
     assert_eq!(blocks.len(), nrg * ncb);
 
-    let add_lut = _mm_load_si128(ADD_LUT.0.as_ptr() as *const __m128i);
-    let sub_lut = _mm_load_si128(SUB_LUT.0.as_ptr() as *const __m128i);
+    // 256-bit sign table for `_mm256_shuffle_epi8`: 00->0, 01->+1, 10->0, 11->-1.
+    let sign_lut = _mm256_setr_epi8(
+        0, 1, 0, -1, 0, 1, 0, -1, 0, 1, 0, -1, 0, 1, 0, -1, 0, 1, 0, -1, 0, 1, 0, -1, 0, 1, 0, -1,
+        0, 1, 0, -1,
+    );
     let code_mask = _mm_set1_epi8(0x03);
 
     for rg in 0..nrg {
-        let mut acc32 = [0i32; 16];
-        let mut acc16 = [0i16; 16];
+        let mut acc32_lo = _mm256_setzero_si256();
+        let mut acc32_hi = _mm256_setzero_si256();
+        let mut acc16 = _mm256_setzero_si256();
+
         for cb in 0..ncb {
             let block = &blocks[rg * ncb + cb];
             for t in 0..4 {
                 let col = cb * 16 + t * 4;
                 let tile = &block.tiles[t];
-                // vmovdqa — tile is align(16).
                 let w = _mm_load_si128(tile.data.as_ptr() as *const __m128i);
-                let mut accv = _mm256_loadu_si256(acc16.as_ptr() as *const __m256i);
-                // Unrolled: srli immediate must be a constant. Shifts 0/2/4/6
-                // extract codes for columns 0..3. Masking with 0x03 after an
-                // epi16 shift drops the cross-byte contamination.
-                macro_rules! col {
-                    ($shifted:expr, $idx:expr) => {{
-                        let codes = _mm_and_si128($shifted, code_mask);
-                        let add_m = _mm_shuffle_epi8(add_lut, codes);
-                        let sub_m = _mm_shuffle_epi8(sub_lut, codes);
-                        let xv = i16::from(x[col + $idx]);
-                        let xvec = _mm256_set1_epi16(xv);
-                        let add16 = _mm256_cvtepi8_epi16(add_m);
-                        let sub16 = _mm256_cvtepi8_epi16(sub_m);
-                        accv = _mm256_adds_epi16(accv, _mm256_and_si256(xvec, add16));
-                        accv = _mm256_subs_epi16(accv, _mm256_and_si256(xvec, sub16));
+
+                macro_rules! pair_cols {
+                    ($s0:expr, $s1:expr, $c0:expr, $c1:expr) => {{
+                        let codes0 = _mm_and_si128($s0, code_mask);
+                        let codes1 = _mm_and_si128($s1, code_mask);
+                        let codes01 = _mm256_set_m128i(codes1, codes0);
+                        let signs01 = _mm256_shuffle_epi8(sign_lut, codes01);
+                        let xv01 = _mm256_set_m128i(
+                            _mm_set1_epi8(x[col + $c1]),
+                            _mm_set1_epi8(x[col + $c0]),
+                        );
+                        let prod01 = _mm256_sign_epi8(xv01, signs01);
+                        let p0 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(prod01));
+                        let p1 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(prod01, 1));
+                        acc16 = _mm256_add_epi16(acc16, _mm256_add_epi16(p0, p1));
                     }};
                 }
-                col!(w, 0);
-                col!(_mm_srli_epi16(w, 2), 1);
-                col!(_mm_srli_epi16(w, 4), 2);
-                col!(_mm_srli_epi16(w, 6), 3);
-                _mm256_storeu_si256(acc16.as_mut_ptr() as *mut __m256i, accv);
+
+                pair_cols!(w, _mm_srli_epi16(w, 2), 0, 1);
+                pair_cols!(_mm_srli_epi16(w, 4), _mm_srli_epi16(w, 6), 2, 3);
             }
+
             if (cb + 1) % 8 == 0 || cb + 1 == ncb {
-                for r in 0..16 {
-                    acc32[r] += i32::from(acc16[r]);
-                    acc16[r] = 0;
-                }
+                let lo16 = _mm256_castsi256_si128(acc16);
+                let hi16 = _mm256_extracti128_si256(acc16, 1);
+                acc32_lo = _mm256_add_epi32(acc32_lo, _mm256_cvtepi16_epi32(lo16));
+                acc32_hi = _mm256_add_epi32(acc32_hi, _mm256_cvtepi16_epi32(hi16));
+                acc16 = _mm256_setzero_si256();
             }
         }
+
         let base = rg * 16;
-        for r in 0..16 {
-            y[base + r] = acc32[r];
-        }
+        _mm256_storeu_si256(y[base..].as_mut_ptr() as *mut __m256i, acc32_lo);
+        _mm256_storeu_si256(y[base + 8..].as_mut_ptr() as *mut __m256i, acc32_hi);
     }
 }
 
-/// NEON microkernel. Same numerical contract as the scalar path:
-/// per-column `vsubq_s8(pos, neg)` contribution, widened with
-/// `vaddl_s8` / `vaddl_high_s8` into the `i16` bucket.
+/// NEON microkernel (`aarch64`): `vqtbl1q_u8` LUT mask lookup + dual-column
+/// `vaddl_s8` / `vaddl_high_s8` wide-adds into `i16`, promoted to `i32` every
+/// 8 cache-line blocks (128 columns). Zero multiplications in the inner loop.
+///
+/// # Safety
+/// Caller must run on an `aarch64` target with `neon` enabled and pass padded
+/// `rows_pad` / `cols_pad` multiples of 16 matching `blocks`, `x`, and `y`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub unsafe fn gemv_bit158_neon(
@@ -209,6 +197,7 @@ pub unsafe fn gemv_bit158_neon(
     cols_pad: usize,
 ) {
     use std::arch::aarch64::*;
+
     assert!(rows_pad % 16 == 0 && cols_pad % 16 == 0);
     assert_eq!(x.len(), cols_pad);
     assert!(y.len() >= rows_pad);
@@ -216,53 +205,63 @@ pub unsafe fn gemv_bit158_neon(
     let ncb = cols_pad / 16;
     assert_eq!(blocks.len(), nrg * ncb);
 
+    // 16-byte LUTs for `vqtbl1q_u8`: code 01 -> 0xFF (add), code 11 -> 0xFF (sub).
+    let mut add_tbl = vdupq_n_u8(0);
+    add_tbl = vsetq_lane_u8::<1>(0xFF, add_tbl);
+    let mut sub_tbl = vdupq_n_u8(0);
+    sub_tbl = vsetq_lane_u8::<3>(0xFF, sub_tbl);
+    let mask03 = vdupq_n_u8(0x03);
+
     for rg in 0..nrg {
-        let mut acc32 = [0i32; 16];
-        // Two i16x8 halves stand in for the 16-lane bucket.
+        let mut acc32_0 = vdupq_n_s32(0);
+        let mut acc32_1 = vdupq_n_s32(0);
+        let mut acc32_2 = vdupq_n_s32(0);
+        let mut acc32_3 = vdupq_n_s32(0);
         let mut acc_lo = vdupq_n_s16(0);
         let mut acc_hi = vdupq_n_s16(0);
+
         for cb in 0..ncb {
             let block = &blocks[rg * ncb + cb];
             for t in 0..4 {
                 let col = cb * 16 + t * 4;
                 let bytes = vld1q_u8(block.tiles[t].data.as_ptr());
-                for c in 0..4u32 {
-                    let shifted = if c == 0 {
-                        bytes
-                    } else {
-                        vshrq_n_u8(bytes, 2 * c)
-                    };
-                    let codes = vandq_u8(shifted, vdupq_n_u8(0x03));
-                    let add_m = vceqq_u8(codes, vdupq_n_u8(0x01));
-                    let sub_m = vceqq_u8(codes, vdupq_n_u8(0x03));
-                    let xv = vdupq_n_s8(x[col + c as usize]);
-                    let pos = vandq_s8(xv, vreinterpretq_s8_u8(add_m));
-                    let neg = vandq_s8(xv, vreinterpretq_s8_u8(sub_m));
-                    let contrib = vsubq_s8(pos, neg);
-                    let zero = vdupq_n_s8(0);
-                    let wide_lo = vaddl_s8(vget_low_s8(contrib), vget_low_s8(zero));
-                    let wide_hi = vaddl_high_s8(contrib, zero);
-                    acc_lo = vaddq_s16(acc_lo, wide_lo);
-                    acc_hi = vaddq_s16(acc_hi, wide_hi);
+
+                macro_rules! decode_col {
+                    ($shifted:expr, $c:expr) => {{
+                        let codes = vandq_u8($shifted, mask03);
+                        let add_m = vreinterpretq_s8_u8(vqtbl1q_u8(add_tbl, codes));
+                        let sub_m = vreinterpretq_s8_u8(vqtbl1q_u8(sub_tbl, codes));
+                        let xv = vdupq_n_s8(x[col + $c]);
+                        vsubq_s8(vandq_s8(xv, add_m), vandq_s8(xv, sub_m))
+                    }};
                 }
+
+                let c0 = decode_col!(bytes, 0);
+                let c1 = decode_col!(vshrq_n_u8::<2>(bytes), 1);
+                acc_lo = vaddq_s16(acc_lo, vaddl_s8(vget_low_s8(c0), vget_low_s8(c1)));
+                acc_hi = vaddq_s16(acc_hi, vaddl_high_s8(c0, c1));
+
+                let c2 = decode_col!(vshrq_n_u8::<4>(bytes), 2);
+                let c3 = decode_col!(vshrq_n_u8::<6>(bytes), 3);
+                acc_lo = vaddq_s16(acc_lo, vaddl_s8(vget_low_s8(c2), vget_low_s8(c3)));
+                acc_hi = vaddq_s16(acc_hi, vaddl_high_s8(c2, c3));
             }
+
             if (cb + 1) % 8 == 0 || cb + 1 == ncb {
-                let mut tmp_lo = [0i16; 8];
-                let mut tmp_hi = [0i16; 8];
-                vst1q_s16(tmp_lo.as_mut_ptr(), acc_lo);
-                vst1q_s16(tmp_hi.as_mut_ptr(), acc_hi);
-                for r in 0..8 {
-                    acc32[r] += i32::from(tmp_lo[r]);
-                    acc32[r + 8] += i32::from(tmp_hi[r]);
-                }
+                acc32_0 = vaddw_s16(acc32_0, vget_low_s16(acc_lo));
+                acc32_1 = vaddw_high_s16(acc32_1, acc_lo);
+                acc32_2 = vaddw_s16(acc32_2, vget_low_s16(acc_hi));
+                acc32_3 = vaddw_high_s16(acc32_3, acc_hi);
                 acc_lo = vdupq_n_s16(0);
                 acc_hi = vdupq_n_s16(0);
             }
         }
+
         let base = rg * 16;
-        for r in 0..16 {
-            y[base + r] = acc32[r];
-        }
+        vst1q_s32(y[base..].as_mut_ptr(), acc32_0);
+        vst1q_s32(y[base + 4..].as_mut_ptr(), acc32_1);
+        vst1q_s32(y[base + 8..].as_mut_ptr(), acc32_2);
+        vst1q_s32(y[base + 12..].as_mut_ptr(), acc32_3);
     }
 }
 
@@ -274,8 +273,6 @@ pub unsafe fn gemv_bit158_neon(
     rows_pad: usize,
     cols_pad: usize,
 ) {
-    // Host has no NEON. Keep the symbol so callers can name it; it is the
-    // scalar contract, not a silent different kernel.
     gemv_bit158_scalar(blocks, x, y, rows_pad, cols_pad);
 }
 
@@ -360,9 +357,9 @@ mod tests {
     }
 
     #[test]
-    fn simd_matches_scalar_on_aligned_block() {
-        let (w, x) = pattern_matrix(32, 64);
-        let packed = pack_ternary(&w, 32, 64).unwrap();
+    fn simd_matches_scalar_on_aligned_and_negative_extremes() {
+        let (w, x) = pattern_matrix(48, 304);
+        let packed = pack_ternary(&w, 48, 304).unwrap();
         let (q, _) = crate::bitlinear::quantize_activations_sym_i8(&x);
         let mut qpad = vec![0i8; packed.cols_pad];
         qpad[..q.len()].copy_from_slice(&q);
@@ -383,5 +380,19 @@ mod tests {
             packed.cols_pad,
         );
         assert_eq!(ys, yd);
+
+        // Extreme -127 activations against -1 trits across 272 cols: (+34544).
+        let w_neg = vec![-1i8; 16 * 272];
+        let p_neg = pack_ternary(&w_neg, 16, 272).unwrap();
+        let x_neg = vec![-127i8; p_neg.cols_pad];
+        let mut y_neg = vec![0i32; p_neg.rows_pad];
+        gemv_bit158(
+            &p_neg.blocks,
+            &x_neg,
+            &mut y_neg,
+            p_neg.rows_pad,
+            p_neg.cols_pad,
+        );
+        assert!(y_neg.iter().all(|&v| v == 272 * 127));
     }
 }

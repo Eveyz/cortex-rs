@@ -22,11 +22,15 @@ dependencies = [
  "cortex-kernels",
  "cortex-sleep",
  "cortex-ssm",
+ "libc",
 ]
 
 [[package]]
 name = "cortex-sleep"
 version = "0.3.0"
+dependencies = [
+ "cortex-hippocampus",
+]
 
 [[package]]
 name = "cortex-ssm"

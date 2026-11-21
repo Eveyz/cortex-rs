@@ -10,6 +10,10 @@ artifacts/
 **/*.rs.bk
 *.ctxb
 *.cxex
+*.wal/
+*.snaps/
+cortex-work/
+ckpts/
 .DS_Store
 __pycache__/
 *.pyc

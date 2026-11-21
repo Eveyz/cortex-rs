@@ -1,35 +1,39 @@
-//! `.ctxb` checkpoint.
+//! `.ctxb` compact 64-byte-aligned binary model format (v1).
 //!
 //! ```text
-//! offset 0   magic b"CTXB"
-//! offset 4   u32 version = 1
-//! offset 8   u32 n_macros, d_model, n_heads, head_dim, vocab, window, ffn, hip
-//! offset 40  f32 rms_eps
-//! offset 44  u32 reserved = 0
-//! offset 48  16 zero bytes (header is 64 bytes)
+//! Header (64 bytes, little-endian):
+//!   0..4   magic b"CTXB"
+//!   4..8   u32 version = 1
+//!   8..40  u32 n_macros, d_model, n_heads, head_dim, vocab, window, ffn, hip
+//!   40..44 f32 rms_eps
+//!   44..48 u32 flags (bit 0 = 1: hip_k, hip_v, and final_norm present; 0 = legacy)
+//!   48..64 reserved zero bytes
 //! ```
 //!
-//! Then, in order:
-//! * embedding `i8[vocab * d_model]`
-//! * embedding / LM-head scales `f32[vocab]` (tied)
-//! * for each macro, three [`BitSsmBlock`]s then one memory block
+//! Payload:
+//! * `emb_i8`: `i8[vocab * d_model]` (`[-127, +127]`, weight-tied with LM head)
+//! * `emb_scale`: `f32[vocab]`
+//! * Per macro (`0..n_macros`): 3 × [`BitSsmBlock`] + 1 × [`MemoryBlock`]
+//! * If `flags & 1 != 0`: `final_norm`: `f32[d_model]`
 //!
-//! A BitLinear is `u32 rows, cols, rows_pad, cols_pad`, padding to a 64-byte
-//! file offset, then raw [`CacheLine16x16`] bytes (`rows_pad/16 * cols_pad/16 * 64`),
-//! then `f32` row scales. The in-memory copy is a `Vec<CacheLine16x16>`, which
-//! is 64-byte aligned.
-//!
-//! The last 4 bytes are IEEE CRC32 of everything before them.
+//! Every [`BitLinearWeights`] block aligns its packed [`CacheLine16x16`] array
+//! to a 64-byte file boundary. Last 4 bytes of the file are IEEE CRC32.
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use cortex_kernels::{BitLinearWeights, CacheLine16x16};
+use cortex_hippocampus::{AsyncHippocampusHandle, HippocampusWeights, PlasticityConfig};
+use cortex_kernels::{crc32_ieee, BitLinearWeights, CacheLine16x16};
 use cortex_ssm::{BitSsmBlock, BitSwiGLU, RmsNorm};
 
 use crate::model::{CortexConfig, CortexModel, MemoryBlock};
-use cortex_hippocampus::{HippocampusWeights, SharedWeightArena};
+
+pub const CTXB_FLAG_FULL_MEM_FINAL_NORM: u32 = 1;
+
+pub fn crc32(data: &[u8]) -> u32 {
+    crc32_ieee(data)
+}
 
 pub fn save_ctxb(model: &CortexModel, path: &Path) -> Result<(), String> {
     let bytes = to_ctxb(model);
@@ -60,7 +64,7 @@ pub fn to_ctxb(model: &CortexModel) -> Vec<u8> {
     put_u32(&mut buf, c.ffn_hidden as u32);
     put_u32(&mut buf, c.hip_hidden as u32);
     put_f32(&mut buf, c.rms_eps);
-    put_u32(&mut buf, 0);
+    put_u32(&mut buf, CTXB_FLAG_FULL_MEM_FINAL_NORM);
     while buf.len() < 64 {
         buf.push(0);
     }
@@ -73,8 +77,9 @@ pub fn to_ctxb(model: &CortexModel) -> Vec<u8> {
         }
         write_mem(&mut buf, &model.mem[m]);
     }
-    let crc = crc32(&buf);
-    put_u32(&mut buf, crc);
+    put_f32s(&mut buf, model.final_norm.weight.as_slice());
+    let sum = crc32(&buf);
+    put_u32(&mut buf, sum);
     buf
 }
 
@@ -84,9 +89,9 @@ pub fn from_ctxb(bytes: &[u8]) -> Result<CortexModel, String> {
     }
     let crc_stored = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
     let body = &bytes[..bytes.len() - 4];
-    let crc = crc32(body);
-    if crc != crc_stored {
-        return Err(format!("CTXB crc mismatch {crc:#x} != {crc_stored:#x}"));
+    let sum = crc32(body);
+    if sum != crc_stored {
+        return Err(format!("CTXB crc mismatch {sum:#x} != {crc_stored:#x}"));
     }
     let mut cur = Cursor { buf: body, o: 4 };
     let version = cur.u32()?;
@@ -104,7 +109,8 @@ pub fn from_ctxb(bytes: &[u8]) -> Result<CortexModel, String> {
         hip_hidden: cur.u32()? as usize,
         rms_eps: cur.f32()?,
     };
-    let _reserved = cur.u32()?;
+    let flags = cur.u32()?;
+    let full_ext = (flags & CTXB_FLAG_FULL_MEM_FINAL_NORM) != 0;
     cur.align(64)?;
     cfg.validate()?;
     let emb_i8 = cur.i8s(cfg.vocab * cfg.d_model)?;
@@ -117,7 +123,11 @@ pub fn from_ctxb(bytes: &[u8]) -> Result<CortexModel, String> {
         for _ in 0..3 {
             ssm.push(read_ssm(&mut cur, &cfg)?);
         }
-        mem.push(read_mem(&mut cur, &cfg)?);
+        mem.push(read_mem(&mut cur, &cfg, full_ext)?);
+    }
+    let mut final_norm = RmsNorm::ones(cfg.d_model, cfg.rms_eps);
+    if full_ext {
+        fill_f32(&mut final_norm, &cur.f32s(cfg.d_model)?)?;
     }
     if cur.o != body.len() {
         return Err(format!(
@@ -132,6 +142,7 @@ pub fn from_ctxb(bytes: &[u8]) -> Result<CortexModel, String> {
         emb_scale,
         ssm,
         mem,
+        final_norm,
     })
 }
 
@@ -181,26 +192,19 @@ fn write_mem(buf: &mut Vec<u8>, b: &MemoryBlock) {
     write_bit(buf, &b.attn.w_v);
     write_bit(buf, &b.attn.w_o);
     write_bit(buf, &b.hip_proj);
-    let (d_in, d_h, d_out, ver, w1, w2) = b.hip.read(|w| {
-        (
-            w.d_in,
-            w.d_hidden,
-            w.d_out,
-            w.version,
-            w.w1.as_slice().to_vec(),
-            w.w2.as_slice().to_vec(),
-        )
-    });
-    put_u32(buf, d_in as u32);
-    put_u32(buf, d_h as u32);
-    put_u32(buf, d_out as u32);
-    put_u64(buf, ver);
-    put_f32s(buf, &w1);
-    put_f32s(buf, &w2);
+    write_bit(buf, &b.hip_k);
+    write_bit(buf, &b.hip_v);
+    let snap = b.hip.snapshot();
+    put_u32(buf, snap.d_in as u32);
+    put_u32(buf, snap.d_hidden as u32);
+    put_u32(buf, snap.d_out as u32);
+    put_u64(buf, snap.version);
+    put_f32s(buf, snap.w1.as_slice());
+    put_f32s(buf, snap.w2.as_slice());
     write_swiglu(buf, &b.ffn);
 }
 
-fn read_mem(cur: &mut Cursor, cfg: &CortexConfig) -> Result<MemoryBlock, String> {
+fn read_mem(cur: &mut Cursor, cfg: &CortexConfig, full_ext: bool) -> Result<MemoryBlock, String> {
     let mut block = MemoryBlock::zeros(cfg);
     fill_f32(&mut block.norm1, &cur.f32s(cfg.d_model)?)?;
     fill_f32(&mut block.norm2, &cur.f32s(cfg.d_model)?)?;
@@ -211,6 +215,10 @@ fn read_mem(cur: &mut Cursor, cfg: &CortexConfig) -> Result<MemoryBlock, String>
     block.attn.w_v = read_bit(cur)?;
     block.attn.w_o = read_bit(cur)?;
     block.hip_proj = read_bit(cur)?;
+    if full_ext {
+        block.hip_k = read_bit(cur)?;
+        block.hip_v = read_bit(cur)?;
+    }
     let d_in = cur.u32()? as usize;
     let d_h = cur.u32()? as usize;
     let d_out = cur.u32()? as usize;
@@ -221,7 +229,7 @@ fn read_mem(cur: &mut Cursor, cfg: &CortexConfig) -> Result<MemoryBlock, String>
     hip.w1.as_mut_slice().copy_from_slice(&w1);
     hip.w2.as_mut_slice().copy_from_slice(&w2);
     hip.version = ver;
-    block.hip = SharedWeightArena::new(hip);
+    block.hip = AsyncHippocampusHandle::spawn(hip, PlasticityConfig::default(), 64);
     block.ffn = read_swiglu(cur)?;
     Ok(block)
 }
@@ -382,30 +390,17 @@ fn pad64(buf: &mut Vec<u8>) {
     }
 }
 
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn crc32_matches_ieee_check_value() {
-        // ISO-HDLC / zlib check value for "123456789".
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]
-    fn ctxb_roundtrip_logits_match() {
+    fn ctxb_roundtrip_logits_match_and_corrupt_crc_fails() {
         let model = CortexModel::from_seed(CortexConfig::mini(), 5);
         let bytes = to_ctxb(&model);
         assert_eq!(&bytes[0..4], b"CTXB");
@@ -420,7 +415,10 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0f32, f32::max);
         assert!(err < 1e-5, "roundtrip logit err {err}");
-        // Tile storage landed in an aligned allocation.
         assert_eq!(loaded.ssm[0].q_proj.blocks.as_ptr() as usize % 64, 0);
+
+        let mut bad = bytes.clone();
+        bad[64] ^= 0xFF;
+        assert!(from_ctxb(&bad).is_err());
     }
 }

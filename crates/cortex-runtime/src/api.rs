@@ -1,4 +1,4 @@
-//! Local HTTP + Unix-socket endpoint.
+//! Local HTTP + Unix-socket endpoint (`RwLock`-shared concurrent inference).
 //!
 //! Routes:
 //! * `GET /status`
@@ -6,20 +6,23 @@
 //! * `POST /reset-mem`
 //! * `POST /v1/chat/completions` (OpenAI-style, `stream: true` emits SSE)
 //!
-//! No cloud client. The handler is std-only so the binary does not pull an
-//! async runtime.
+//! Concurrent inference requests acquire a shared `RwLock::read()` guard and
+//! run with independent `ModelState` + lock-free `SharedWeightArena` hippocampus
+//! reads — zero global `Mutex` serialization across chat completions.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+use cortex_hippocampus::SnapshotStore;
 
 use crate::generate::{stream_tokens, Session};
 use crate::model::CortexModel;
 
 pub struct Server {
-    pub model: Arc<Mutex<CortexModel>>,
+    pub model: Arc<RwLock<CortexModel>>,
     pub model_path: PathBuf,
 }
 
@@ -75,6 +78,14 @@ fn handle_unix(mut stream: std::os::unix::net::UnixStream, server: &Server) -> s
     Ok(())
 }
 
+fn snap_dir_for(model_path: &std::path::Path) -> PathBuf {
+    model_path.with_extension("snaps")
+}
+
+fn wal_dir_for(model_path: &std::path::Path) -> PathBuf {
+    model_path.with_extension("wal")
+}
+
 fn dispatch(req: &str, server: &Server) -> String {
     let mut lines = req.lines();
     let request_line = lines.next().unwrap_or("");
@@ -86,22 +97,65 @@ fn dispatch(req: &str, server: &Server) -> String {
         return text_ok(&status_text(server));
     }
     if method == "POST" && path == "/reset-mem" {
-        server.model.lock().expect("model").reset_memory_to_init();
+        let model = server.model.read().expect("model read");
+        let sdir = snap_dir_for(&server.model_path);
+        if let Ok(store) = SnapshotStore::new(&sdir) {
+            let vs = store.list_versions();
+            if vs.len() >= 2 {
+                let prev = vs[vs.len() - 2];
+                if model.rollback_hippocampus(&store, prev).is_ok() {
+                    return text_ok(&format!("memory rolled back to snapshot v{prev}\n"));
+                }
+            }
+        }
+        model.reset_memory_to_init();
         return text_ok("memory reset\n");
     }
     if method == "POST" && path == "/sleep" {
-        let mut model = server.model.lock().expect("model");
-        let seqs = anchor_seqs();
-        let (before, after) = model.mezo_steps(&seqs, 1, 0.05, 0.1, 1);
-        return text_ok(&format!("slept ce {before:.4} -> {after:.4}\n"));
+        let mut model = server.model.write().expect("model write");
+        let mut replay = cortex_sleep::ReplayBuffer::new();
+        let wal_root = wal_dir_for(&server.model_path);
+        for m in 0..model.cfg.n_macros {
+            let wf = wal_root.join(format!("macro_{m}")).join("episodes.wal");
+            if wf.exists() {
+                let _ = replay.load_wal(&wf);
+            }
+        }
+        for seq in anchor_seqs(model.cfg.vocab) {
+            replay.add_anchor_tokens(seq);
+        }
+        let seqs = replay.mixed_token_sequences(10);
+        let (before, after) = model.mezo_steps(&seqs, 5, 1e-4, 5e-6, 1);
+        let sdir = snap_dir_for(&server.model_path);
+        let snap_store = SnapshotStore::new(&sdir).ok();
+        if let Some(ref store) = snap_store {
+            if store.list_versions().is_empty() {
+                let pre: Vec<_> = model.mem.iter().map(|m| m.hip.snapshot()).collect();
+                let _ = store.save_macros(&pre);
+            }
+        }
+        let (d1, d2, ver) = model
+            .consolidate_all_hippocampus(snap_store.as_ref())
+            .unwrap_or((0, 0, None));
+        if server.model_path.exists() {
+            let _ = crate::ctxb::save_ctxb(&model, &server.model_path);
+        }
+        return text_ok(&format!(
+            "slept ce {before:.4} -> {after:.4} wal_eps={} dedup={}+{} snap={:?}\n",
+            replay.wal_episodes.len(),
+            d1,
+            d2,
+            ver
+        ));
     }
     if method == "POST" && path == "/v1/chat/completions" {
         let prompt = json_string_field(body, "content").unwrap_or_default();
         let tools_accepted = crate::harness::tools_mentioned(body);
         let stream = body.replace(' ', "").contains("\"stream\":true");
         let max_tokens = json_u32_field(body, "max_tokens").unwrap_or(16).min(64);
-        let mut model = server.model.lock().expect("model");
-        let mut session = Session::new(&mut model, &prompt, max_tokens as usize, 0.0, 1.0, 1.0, 1);
+        // Shared read lock — concurrent sessions run in parallel without blocking!
+        let model = server.model.read().expect("model read");
+        let mut session = Session::new(&model, &prompt, max_tokens as usize, 0.0, 1.0, 1.0, 1);
         let pieces = stream_tokens(&mut session);
         let text: String = pieces.iter().copied().map(token_text).collect();
         if stream {
@@ -125,7 +179,7 @@ fn dispatch(req: &str, server: &Server) -> String {
 }
 
 fn status_text(server: &Server) -> String {
-    let model = server.model.lock().expect("model");
+    let model = server.model.read().expect("model read");
     format!(
         "layers={} d_model={} vocab={} hip_version={} isa={} model={}\n",
         model.n_layers(),
@@ -137,8 +191,12 @@ fn status_text(server: &Server) -> String {
     )
 }
 
-fn anchor_seqs() -> Vec<Vec<u32>> {
-    vec![vec![1, 2, 3, 4], vec![4, 3, 2, 1]]
+fn anchor_seqs(vocab: usize) -> Vec<Vec<u32>> {
+    let cap = vocab.max(2) as u32;
+    vec![
+        vec![1 % cap, 2 % cap, 3 % cap, 4 % cap],
+        vec![4 % cap, 3 % cap, 2 % cap, 1 % cap],
+    ]
 }
 
 fn token_text(id: u32) -> String {
