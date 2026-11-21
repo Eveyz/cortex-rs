@@ -10,6 +10,8 @@ pub struct Session<'a> {
     pub model: &'a mut CortexModel,
     pub state: crate::model::ModelState,
     pub history: Vec<u32>,
+    pub prompt_len: usize,
+    pub tokenizer: Tokenizer,
     pub logits: Vec<f32>,
     pub remaining: usize,
     pub temperature: f32,
@@ -28,8 +30,30 @@ impl<'a> Session<'a> {
         repetition_penalty: f32,
         seed: u64,
     ) -> Self {
-        let tok = Tokenizer::byte_level();
-        let ids = tok.encode(prompt);
+        Self::with_tokenizer(
+            model,
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            repetition_penalty,
+            seed,
+            Tokenizer::byte_level(),
+        )
+    }
+
+    pub fn with_tokenizer(
+        model: &'a mut CortexModel,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        repetition_penalty: f32,
+        seed: u64,
+        tokenizer: Tokenizer,
+    ) -> Self {
+        let ids = tokenizer.encode(prompt);
+        let prompt_len = ids.len();
         let mut state = model.new_state();
         let mut logits = vec![0f32; model.cfg.vocab];
         if ids.is_empty() {
@@ -43,6 +67,8 @@ impl<'a> Session<'a> {
             model,
             state,
             history: ids,
+            prompt_len,
+            tokenizer,
             logits,
             remaining: max_tokens,
             temperature,
@@ -50,6 +76,11 @@ impl<'a> Session<'a> {
             repetition_penalty,
             rng: seed.max(1),
         }
+    }
+
+    pub fn continuation_text(&self) -> String {
+        let start = self.prompt_len.min(self.history.len());
+        self.tokenizer.decode_string(&self.history[start..])
     }
 }
 

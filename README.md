@@ -149,6 +149,13 @@ greedy decode of 32 tokens after the prompt `hello`:
 That is the toy graph only. It is not a measurement of the 24-layer
 `d_model = 2048` shape, and it is not a claim about a trained model.
 
+## Step 1 sandbox
+
+A ~25M-parameter story model (8 layers, `d_model = 512`, vocab 4096) is
+documented in [docs/step1.md](docs/step1.md). It is trained with
+`python3 tools/train_seed_qat.py --step1` on synthetic Chinese children's
+stories, then exported to `.ctxb`. That run is separate from `cargo test`.
+
 ## 中文
 
 这是一个纯 Rust 的本地推理骨架：1.58-bit 三值 GEMV（无 C 编译器）、三层

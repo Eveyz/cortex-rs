@@ -509,6 +509,12 @@ def self_check(model: Mini, rust_bin: Path, tokens: list[int]) -> None:
 
 
 def main() -> None:
+    if "--step1" in sys.argv:
+        sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--step1"]
+        from step1_train import main as step1_main
+
+        step1_main()
+        return
     p = argparse.ArgumentParser(description="Tiny BitLinear QAT seed exporter (no corpus download).")
     p.add_argument("--steps", type=int, default=2, help="QAT / hippocampus SGD steps")
     p.add_argument("--joint-hippocampus", action="store_true", help="joint-train W1/W2 with the seed")

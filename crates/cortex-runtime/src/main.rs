@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use cortex_runtime::ctxb::{load_ctxb, save_ctxb};
 use cortex_runtime::generate::{format_tick, next_token, rss_kb, Session};
 use cortex_runtime::model::{CortexConfig, CortexModel};
+use cortex_runtime::tokenizer::Tokenizer;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
         "reset-mem" => cmd_reset(&args[1..]),
         "serve" => cmd_serve(&args[1..]),
         "init-mini" => cmd_init_mini(&args[1..]),
+        "encode" => cmd_encode(&args[1..]),
         other => {
             eprintln!("unknown command {other}\n{}", usage());
             ExitCode::from(2)
@@ -49,8 +51,9 @@ fn main() -> ExitCode {
 
 fn usage() -> &'static str {
     "cortex-cli commands:\n  \
-     generate --model FILE --prompt TEXT [--max-tokens 32] [--temperature 0.8]\n            \
+     generate --model FILE --prompt TEXT [--vocab MERGES] [--max-tokens 32] [--temperature 0.8]\n            \
      [--top-p 0.9] [--repetition-penalty 1.1] [--seed 1]\n  \
+     encode --vocab MERGES --input TEXT --output TOKENS.u32\n  \
      logits --model FILE --ids 1,2,3\n  \
      /status --model FILE\n  \
      /sleep --model FILE\n  \
@@ -101,7 +104,17 @@ fn cmd_generate(args: &[String]) -> ExitCode {
     let seed: u64 = flag(args, "--seed")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let mut session = Session::new(
+    let tokenizer = match flag(args, "--vocab") {
+        Some(path) => match Tokenizer::from_merge_file(std::path::Path::new(path)) {
+            Ok(tok) => tok,
+            Err(e) => {
+                eprintln!("vocab {path}: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        None => Tokenizer::byte_level(),
+    };
+    let mut session = Session::with_tokenizer(
         &mut model,
         prompt,
         max_tokens,
@@ -109,6 +122,7 @@ fn cmd_generate(args: &[String]) -> ExitCode {
         top_p,
         penalty,
         seed,
+        tokenizer,
     );
     let mut n = 0usize;
     while let Some(tick) = next_token(&mut session) {
@@ -116,7 +130,57 @@ fn cmd_generate(args: &[String]) -> ExitCode {
         n += 1;
     }
     println!("tokens={n}");
+    println!("continuation={}", session.continuation_text());
     println!("rss_kb={}", rss_kb());
+    ExitCode::SUCCESS
+}
+
+fn cmd_encode(args: &[String]) -> ExitCode {
+    let vocab = match flag(args, "--vocab") {
+        Some(p) => p,
+        None => {
+            eprintln!("missing --vocab");
+            return ExitCode::from(2);
+        }
+    };
+    let input = match flag(args, "--input") {
+        Some(p) => p,
+        None => {
+            eprintln!("missing --input");
+            return ExitCode::from(2);
+        }
+    };
+    let output = match flag(args, "--output") {
+        Some(p) => p,
+        None => {
+            eprintln!("missing --output");
+            return ExitCode::from(2);
+        }
+    };
+    let tok = match Tokenizer::from_merge_file(std::path::Path::new(vocab)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("vocab: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let text = match std::fs::read_to_string(input) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("read {input}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let ids = tok.encode(&text);
+    let mut bytes = Vec::with_capacity(ids.len() * 4);
+    for id in &ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    if let Err(e) = std::fs::write(output, &bytes) {
+        eprintln!("write {output}: {e}");
+        return ExitCode::from(1);
+    }
+    eprintln!("tokens={}", ids.len());
     ExitCode::SUCCESS
 }
 

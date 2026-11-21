@@ -79,6 +79,23 @@ impl CortexConfig {
         }
     }
 
+    /// Step 1 sandbox: 2 macros, 8 layers, d_model 512, vocab 4096.
+    /// Weight-matrix count is about 25.09M before the small row-scale vectors.
+    /// This constructor does not allocate those weights.
+    pub fn step1_stories() -> Self {
+        Self {
+            n_macros: 2,
+            d_model: 512,
+            n_heads: 8,
+            head_dim: 64,
+            vocab: 4096,
+            window: 64,
+            ffn_hidden: 1120,
+            hip_hidden: 128,
+            rms_eps: 1e-6,
+        }
+    }
+
     pub fn mini() -> Self {
         Self {
             n_macros: 1,
@@ -505,6 +522,18 @@ fn det(i: usize, salt: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step1_stories_shape_is_valid_and_unallocated() {
+        let c = CortexConfig::step1_stories();
+        c.validate().unwrap();
+        assert_eq!(c.n_macros, 2);
+        assert_eq!(c.n_layers(), 8);
+        assert_eq!(c.d_model, 512);
+        assert_eq!(c.vocab, 4096);
+        assert_eq!(c.window, 64);
+        assert_eq!(c.n_heads * c.head_dim, c.d_model);
+    }
 
     #[test]
     fn prod_and_test_shapes() {
