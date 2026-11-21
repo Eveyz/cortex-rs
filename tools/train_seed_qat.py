@@ -36,7 +36,6 @@ from __future__ import annotations
 import argparse
 import math
 import random
-import re
 import struct
 import subprocess
 import sys
@@ -685,6 +684,7 @@ def train_seed(
 # ---------------------------------------------------------------------------
 
 _FP_GATE = 1e-05  # FP intermediates must agree to this (observed ~1e-06)
+_MARGIN_GATE = 1e-05  # primary (uncontaminated) flips must sit within this FP margin of .5
 _MAX_FLIP_FRAC = 0.05  # flips must touch at most 5% of all INT8 elements
 
 
@@ -716,7 +716,7 @@ def _parse_rust_dump(path: Path) -> dict:
             out[(f"S_{kind}", idx, pos)] = np.array(
                 [float(v) for v in body], dtype=np.float32
             )
-        elif tag in ("QO", "QX"):
+        elif tag in ("QN", "QO", "QX", "QH", "MQ", "MX"):
             out[(tag, idx, pos)] = np.array([int(v) for v in parts[3:]], dtype=np.int64)
         else:
             out[(tag, idx, pos)] = np.array(
@@ -790,11 +790,15 @@ def _py_intermediates(model: CortexSeedModel, tokens: list[int]):
             hidden = F.silu(gate_out) * up_out
             ffn_out = blk.down(hidden, False)
             block_out = x1 + ffn_out
+            qn_int, qn_scale = quantize_act_ste(xn, training=False)
             qo_int, qo_scale = quantize_act_ste(o_delta, training=False)
             qx_int, qx_scale = quantize_act_ste(xn2, training=False)
+            qh_int, qh_scale = quantize_act_ste(hidden, training=False)
             for t in range(steps):
                 vals[("S_in", bi, t)] = x[t].numpy()
                 vals[("S_out", bi, t)] = block_out[t].numpy()
+                vals[("SN", bi, t)] = xn[t].numpy()
+                vals[("QN", bi, t)] = qn_int[t].numpy()
                 vals[("SQ", bi, t)] = q_raw.reshape(steps, -1)[t].numpy()
                 vals[("SK", bi, t)] = k_raw.reshape(steps, -1)[t].numpy()
                 vals[("SV", bi, t)] = v.reshape(steps, -1)[t].numpy()
@@ -806,20 +810,34 @@ def _py_intermediates(model: CortexSeedModel, tokens: list[int]):
                 vals[("FG", bi, t)] = gate_out[t].numpy()
                 vals[("FU", bi, t)] = up_out[t].numpy()
                 vals[("FH", bi, t)] = hidden[t].numpy()
+                vals[("QH", bi, t)] = qh_int[t].numpy()
                 vals[("SF", bi, t)] = ffn_out[t].numpy()
+                scales[("QN", bi, t)] = float(qn_scale[t].reshape(-1)[0])
                 scales[("QO", bi, t)] = float(qo_scale[t].reshape(-1)[0])
                 scales[("QX", bi, t)] = float(qx_scale[t].reshape(-1)[0])
+                scales[("QH", bi, t)] = float(qh_scale[t].reshape(-1)[0])
         for mi, mem in enumerate(model.mems):
             x = mem_in[mi][0]  # [T, d]
             xn = rmsnorm(x, mem.norm1, cfg.rms_eps)
+            mq_int, mq_scale = quantize_act_ste(xn, training=False)
             a = mem._ring_attn(xn.unsqueeze(0), False)[0]
             qh = l2_norm_last(mem.hip_proj(xn.unsqueeze(0), False))[0]
             m = F.silu(F.linear(qh, mem.w1)) @ mem.w2.T
+            g = torch.sigmoid(mem.gate_w * xn + mem.gate_b)
+            y = x + g * a + (1.0 - g) * m
+            xn2 = rmsnorm(y, mem.norm2, cfg.rms_eps)
+            mx_int, mx_scale = quantize_act_ste(xn2, training=False)
             for t in range(steps):
                 vals[("X", mi, t)] = x[t].numpy()
+                vals[("MN", mi, t)] = xn[t].numpy()
+                vals[("MQ", mi, t)] = mq_int[t].numpy()
                 vals[("A", mi, t)] = a[t].numpy()
                 vals[("Q", mi, t)] = qh[t].numpy()
                 vals[("M", mi, t)] = m[t].numpy()
+                vals[("MY", mi, t)] = xn2[t].numpy()
+                vals[("MX", mi, t)] = mx_int[t].numpy()
+                scales[("MQ", mi, t)] = float(mq_scale[t].reshape(-1)[0])
+                scales[("MX", mi, t)] = float(mx_scale[t].reshape(-1)[0])
         for t in range(steps):
             vals[("L", 0, t)] = py_logits[t].numpy()
     return vals, scales
@@ -872,63 +890,67 @@ def _flip_analysis(model, tokens, rust_bin, blob, got_rows):
     # quantization error flips a large fraction of elements, a boundary
     # flip touches only a few).
     flips = []
-    flipped_macro_pos = set()
-    first_flip_pos = {}
     total_q = 0
-    for tag, fp_tag in (("QO", "SO"), ("QX", "SX")):
-        for (t2, blk, pos), py_q in py.items():
+    # Ordered stage index within each macro:
+    # SSM blocks: layer_id = (blk // 3) * 4 + (blk % 3), sub-stage QN=0, QO=1, QX=2, QH=3
+    # Mem blocks: layer_id = macro * 4 + 3,              sub-stage MQ=0, MX=1
+    q_specs = (
+        ("QN", "SN", False, 0),
+        ("QO", "SO", False, 1),
+        ("QX", "SX", False, 2),
+        ("QH", "FH", False, 3),
+        ("MQ", "MN", True, 0),
+        ("MX", "MY", True, 1),
+    )
+    first_flip_by_layer: dict[int, int] = {}
+    layer_stage_flips: set[tuple[int, int, int]] = set()
+    for tag, fp_tag, is_mem, stage in q_specs:
+        for (t2, idx, pos), py_q in py.items():
             if t2 != tag:
                 continue
             total_q += py_q.size
-            key = (tag, blk, pos)
+            key = (tag, idx, pos)
             if key not in rs:
                 continue
             diff = rs[key] - py_q
+            layer_id = (idx * 4 + 3) if is_mem else ((idx // 3) * 4 + (idx % 3))
             for elem in np.nonzero(diff)[0]:
-                scale = scales[(tag, blk, pos)]
-                py_fp = float(py[(fp_tag, blk, pos)][elem])
-                rs_fp = float(rs[(fp_tag, blk, pos)][elem])
+                scale = scales[(tag, idx, pos)]
+                py_fp = float(py[(fp_tag, idx, pos)][elem])
+                rs_fp = float(rs[(fp_tag, idx, pos)][elem])
                 frac = py_fp / scale - math.floor(py_fp / scale)
                 margin = abs(frac - 0.5) * scale
                 fp_diff = abs(rs_fp - py_fp)
                 flips.append(
-                    (tag, blk, pos, int(elem), int(rs[key][elem]),
+                    (tag, idx, pos, int(elem), int(rs[key][elem]),
                      int(py_q[elem]), margin, fp_diff)
                 )
-                flipped_macro_pos.add((blk // 3, pos))
-                macro = blk // 3
-                first_flip_pos[macro] = min(first_flip_pos.get(macro, pos), pos)
+                first_flip_by_layer[layer_id] = min(first_flip_by_layer.get(layer_id, pos), pos)
+                layer_stage_flips.add((layer_id, pos, stage))
 
-    # FP agreement over SSM inputs. A flip at (blk, pos) changes the output
-    # of that block, so the input of every downstream block (blk2 > blk) at
-    # the same position differs by design; exclude those. The flipping
-    # block's own input is unaffected by its own flip.
-    flipped_block_pos = {(blk, pos) for _, blk, pos, *_ in flips}
+    # FP agreement over SSM inputs (`S_in`) and Mem inputs/outputs (`X`, `A`, `Q`, `M`)
+    # at positions unreachable from any upstream layer flip.
     fp_max = 0.0
     for key, py_v in py.items():
-        if key[0] != "S_in":
-            continue
-        _, blk, pos = key
-        if any(b < blk and (b, pos) in flipped_block_pos for b in range(blk)):
-            continue
-        if key in rs:
-            fp_max = max(
-                fp_max,
-                float(np.max(np.abs(rs[key].astype(np.float64) - py_v.astype(np.float64)))),
-            )
-
-    # FP agreement over mem X/A/Q/M. A flip corrupts the ring state, so
-    # the ring output A differs at every later position in that macro;
-    # exclude A at positions >= the first flip there (earlier positions
-    # still validate the ring). X/Q/M do not read the ring state, so they
-    # are only excluded at the flipped positions themselves.
-    for key, py_v in py.items():
-        if key[0] not in ("X", "A", "Q", "M"):
-            continue
-        macro, pos = key[1], key[2]
-        if key[0] == "A" and macro in first_flip_pos and pos >= first_flip_pos[macro]:
-            continue
-        if (macro, pos) in flipped_macro_pos:
+        if key[0] == "S_in":
+            _, blk, pos = key
+            layer_id = (blk // 3) * 4 + (blk % 3)
+            if any(
+                l < layer_id and l in first_flip_by_layer and pos >= first_flip_by_layer[l]
+                for l in range(layer_id)
+            ):
+                continue
+        elif key[0] in ("X", "A", "Q", "M"):
+            macro, pos = key[1], key[2]
+            layer_id = macro * 4 + 3
+            if any(
+                l < layer_id and l in first_flip_by_layer and pos >= first_flip_by_layer[l]
+                for l in range(layer_id)
+            ):
+                continue
+            if key[0] in ("A", "Q", "M") and (layer_id, pos, 0) in layer_stage_flips:
+                continue
+        else:
             continue
         if key in rs:
             fp_max = max(
@@ -936,11 +958,35 @@ def _flip_analysis(model, tokens, rust_bin, blob, got_rows):
                 float(np.max(np.abs(rs[key].astype(np.float64) - py_v.astype(np.float64)))),
             )
 
-    flips_ok = 1 <= len(flips) <= max(1, int(_MAX_FLIP_FRAC * total_q))
+    # Every primary (uncontaminated) flip must be a genuine +-1 rounding-boundary
+    # flip: FP inputs agree (fp_diff <= _FP_GATE), delta is +-1, and py_fp sits
+    # within max(_MARGIN_GATE, 2 * fp_diff) of a .5 tie.
+    stage_of = {tag: (is_mem, stage) for tag, _, is_mem, stage in q_specs}
+    primary_flips_ok = True
+    primary_count = 0
+    for tag, idx, pos, _elem, rs_v, py_v, margin, fp_diff in flips:
+        is_mem, stage = stage_of[tag]
+        layer_id = (idx * 4 + 3) if is_mem else ((idx // 3) * 4 + (idx % 3))
+        contaminated = any(
+            l < layer_id and l in first_flip_by_layer and pos >= first_flip_by_layer[l]
+            for l in range(layer_id)
+        ) or any((layer_id, pos, s) in layer_stage_flips for s in range(stage))
+        if not contaminated:
+            primary_count += 1
+            if abs(rs_v - py_v) != 1 or fp_diff > _FP_GATE or margin > max(_MARGIN_GATE, 2.0 * fp_diff):
+                primary_flips_ok = False
+
+    flips_ok = (
+        1 <= len(flips) <= max(1, int(_MAX_FLIP_FRAC * total_q))
+        and primary_count >= 1
+        and primary_flips_ok
+    )
     is_flip = drift <= 1e-06 and fp_max <= _FP_GATE and flips_ok
     return is_flip, {
         "fp_max": fp_max,
         "n_flips": len(flips),
+        "primary_flips": primary_count,
+        "primary_flips_ok": primary_flips_ok,
         "flips": flips,
         "dump_drift": drift,
     }

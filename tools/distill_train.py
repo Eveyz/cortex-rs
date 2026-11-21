@@ -205,7 +205,15 @@ def train(args) -> int:
         flush=True,
     )
     if start_step >= total_steps:
-        print(f"already at step {start_step}/{total_steps}; nothing to train", flush=True)
+        out_path = Path(args.out)
+        if not out_path.exists():
+            out = export_to_ctxb(model, out_path)
+            print(
+                f"already at step {start_step}/{total_steps}; exported missing {out} ({out.stat().st_size} bytes)",
+                flush=True,
+            )
+        else:
+            print(f"already at step {start_step}/{total_steps}; nothing to train", flush=True)
         return 0
 
     ckpt_dir = Path(args.ckpt_dir)
@@ -221,7 +229,6 @@ def train(args) -> int:
         )
         tmp.replace(path)
 
-    rng = random.Random(args.seed + 1)
     step = start_step
     micro = 0
     t0 = time.time()
@@ -229,7 +236,7 @@ def train(args) -> int:
     model.train()
     done = False
     # Skip the already-trained part: whole epochs, then micro-batches into
-    # the current epoch. (The resumed epoch is reshuffled — harmless.)
+    # the current epoch. Per-epoch RNG seed keeps shuffle deterministic across resumes.
     start_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
     skip_micro = (start_step % steps_per_epoch) * args.grad_accum if start_step > 0 else 0
     if start_step > 0:
@@ -241,7 +248,8 @@ def train(args) -> int:
     for epoch in range(start_epoch, args.epochs):
         if done:
             break
-        for batch in batches(train_set, args.batch_size, rng):
+        epoch_rng = random.Random(args.seed + 1 + epoch)
+        for batch in batches(train_set, args.batch_size, epoch_rng):
             if skip_micro > 0:
                 skip_micro -= 1
                 continue
@@ -285,7 +293,8 @@ def train(args) -> int:
                         f"{generate_sample(model, p, 64, device)[:200]}",
                         flush=True,
                     )
-                save_ckpt(ckpt_dir / f"step-{step}.pt")
+                if args.keep_all_ckpts:
+                    save_ckpt(ckpt_dir / f"step-{step}.pt")
                 save_ckpt(ckpt_dir / "latest.pt")
                 last_ckpt = time.time()
                 if args.export_every:
@@ -303,7 +312,8 @@ def train(args) -> int:
 
     ev = eval_loss(model, eval_set, args.batch_size, device)
     print(f"final eval loss: {ev:.4f}", flush=True)
-    save_ckpt(ckpt_dir / "final.pt")
+    if args.keep_all_ckpts:
+        save_ckpt(ckpt_dir / "final.pt")
     save_ckpt(ckpt_dir / "latest.pt")
     out = export_to_ctxb(model, args.out)
     print(f"exported {out} ({out.stat().st_size} bytes)")
@@ -328,6 +338,7 @@ def self_check() -> int:
         data_file.write_text(
             "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
         )
+        ckpt_dir = td_path / "ckpts"
         out_ctxb = td_path / "student.ctxb"
         rc = main(
             [
@@ -348,12 +359,71 @@ def self_check() -> int:
                 "--eval-every",
                 "0",
                 "--ckpt-dir",
-                str(td_path / "ckpts"),
+                str(ckpt_dir),
                 "--out",
                 str(out_ctxb),
             ]
         )
         assert rc == 0 and out_ctxb.exists() and out_ctxb.read_bytes()[:4] == b"CTXB"
+        assert (ckpt_dir / "latest.pt").exists() and not (ckpt_dir / "final.pt").exists()
+        # Verify multi-session resume continues cleanly and exports missing .ctxb
+        out_ctxb.unlink()
+        rc2 = main(
+            [
+                "--data",
+                str(data_file),
+                "--config",
+                "micro",
+                "--epochs",
+                "2",
+                "--batch-size",
+                "2",
+                "--grad-accum",
+                "1",
+                "--seq-len",
+                "32",
+                "--eval-frac",
+                "0.25",
+                "--eval-every",
+                "0",
+                "--ckpt-dir",
+                str(ckpt_dir),
+                "--init-from",
+                str(ckpt_dir / "latest.pt"),
+                "--out",
+                str(out_ctxb),
+            ]
+        )
+        assert rc2 == 0 and out_ctxb.exists() and out_ctxb.read_bytes()[:4] == b"CTXB"
+        # Verify post-completion missing-export recovery
+        out_ctxb.unlink()
+        rc3 = main(
+            [
+                "--data",
+                str(data_file),
+                "--config",
+                "micro",
+                "--epochs",
+                "2",
+                "--batch-size",
+                "2",
+                "--grad-accum",
+                "1",
+                "--seq-len",
+                "32",
+                "--eval-frac",
+                "0.25",
+                "--eval-every",
+                "0",
+                "--ckpt-dir",
+                str(ckpt_dir),
+                "--init-from",
+                str(ckpt_dir / "latest.pt"),
+                "--out",
+                str(out_ctxb),
+            ]
+        )
+        assert rc3 == 0 and out_ctxb.exists() and out_ctxb.read_bytes()[:4] == b"CTXB"
     print("distill_train self-check ok")
     return 0
 
@@ -362,7 +432,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Distill Qwen3-teacher JSONL into the 1.58-bit Cortex student"
     )
-    ap.add_argument("--self-check", action="store_true", help="smoke-test masking & CTXB export")
+    ap.add_argument("--self-check", action="store_true", help="smoke-test masking, resume & CTXB export")
     ap.add_argument("--data", default=None, help="JSONL from distill_generate.py")
     ap.add_argument("--config", choices=["micro", "production"], default="production")
     ap.add_argument("--out", default="student.ctxb")
@@ -376,6 +446,11 @@ def main(argv=None) -> int:
         "--ckpt-every-min", type=float, default=30,
         help="save <ckpt-dir>/latest.pt at least this often (minutes); "
         "0 disables the timer (eval checkpoints still save latest.pt)",
+    )
+    ap.add_argument(
+        "--keep-all-ckpts", action="store_true",
+        help="also keep step-<N>.pt and final.pt alongside latest.pt "
+        "(off by default to avoid filling Google Drive with 19GB copies)",
     )
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--batch-size", type=int, default=2)

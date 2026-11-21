@@ -133,6 +133,7 @@ CATEGORIES = list(DEFAULT_COUNTS)
 # ---------------------------------------------------------------------------
 
 HF_QUESTIONS: dict[str, list] = {}
+SEEN_PROMPTS: set[str] = set()
 
 
 def _load_hf_dataset(name: str, config: str | None = None):
@@ -168,10 +169,10 @@ def load_gsm8k_questions(rng: random.Random) -> list[tuple[str, str, str]]:
 
 
 def load_humaneval_questions() -> list[tuple[str, str, str]]:
-    """HumanEval (164 problems). Returns (task, tests, 'humaneval')
-    where tests is a test file that imports the entry point from
-    solution.py, runs the dataset's check(), and prints
-    ALL TESTS PASSED (the same gate run_tests() applies)."""
+    """HumanEval (164 problems from `test` split — WARNING: contaminates
+    HumanEval as a held-out eval benchmark!). Returns (task, tests, 'humaneval')
+    where tests imports the entry point from solution.py, runs check(), and
+    prints ALL TESTS PASSED."""
     ds = _load_hf_dataset("openai/openai_humaneval")
     out = []
     for rec in ds["test"]:
@@ -187,23 +188,35 @@ def load_humaneval_questions() -> list[tuple[str, str, str]]:
 
 
 def load_mbpp_questions() -> list[tuple[str, str, str]]:
-    """MBPP train (974 problems). Returns (task, tests, 'mbpp').
-    The function name is taken from the reference solution's def
-    line; test_setup_code (if any) is included before the asserts."""
+    """MBPP train (374 problems). Returns (task, tests, 'mbpp').
+    Extracts the required `def name(...)` signature from the reference solution
+    and appends it to `task` so the teacher uses the exact function name and
+    parameter list expected by `test_list`."""
     ds = _load_hf_dataset("google-research-datasets/mbpp")
     out = []
     for rec in ds["train"]:
-        m = re.search(r"def\s+(\w+)\s*\(", rec["code"])
-        if not m:
-            continue
-        name = m.group(1)
+        sig_m = re.search(
+            r"^(def\s+(\w+)\s*\([^)]*\)\s*(?:->[^:]+)?:)",
+            rec["code"],
+            flags=re.MULTILINE,
+        )
+        if sig_m:
+            sig = sig_m.group(1).strip()
+            name = sig_m.group(2)
+        else:
+            m = re.search(r"def\s+(\w+)\s*\(", rec["code"])
+            if not m:
+                continue
+            name = m.group(1)
+            sig = f"def {name}(...):"
         setup = (rec.get("test_setup_code") or "").strip()
         body = "\n".join(rec["test_list"])
         tests = f"from solution import {name}\n"
         if setup:
             tests += setup + "\n"
         tests += body + "\nprint('ALL TESTS PASSED')\n"
-        out.append((rec["text"].strip(), tests, "mbpp"))
+        task = f"{rec['text'].strip()}\n函数签名必须为：{sig}"
+        out.append((task, tests, "mbpp"))
     return out
 
 # ---------------------------------------------------------------------------
@@ -411,28 +424,36 @@ def gen_math(llm, sampling, n: int, rng: random.Random):
     for problem, expected, source in HF_QUESTIONS.get("math", []):
         if made >= n:
             return
+        prompt_str = f"请一步一步解答这道题，最后一个字给出答案：{problem}"
+        if dedup_key(prompt_str) in SEEN_PROMPTS:
+            continue
         msgs = [
             {"role": "system", "content": "你是一位耐心的小学数学老师。一步一步推导，最后给出答案。"},
-            {"role": "user", "content": f"请一步一步解答这道题，最后一个字给出答案：{problem}"},
+            {"role": "user", "content": prompt_str},
         ]
         text = chat(llm, msgs, sampling, think=True)
         got = extract_final_number(strip_think(text))
         if answers_match(got, expected):
-            yield (f"请一步一步解答这道题，最后一个字给出答案：{problem}", text, True,
+            SEEN_PROMPTS.add(dedup_key(prompt_str))
+            yield (prompt_str, text, True,
                    {"source": source, "expected": expected})
             made += 1
     # 1) Seed problems (exact verification).
     for problem, expected in MATH_SEEDS:
         if made >= n:
             return
+        prompt_str = f"请一步一步解答这道题，最后一个字给出答案：{problem}"
+        if dedup_key(prompt_str) in SEEN_PROMPTS:
+            continue
         msgs = [
             {"role": "system", "content": "你是一位耐心的小学数学老师。一步一步推导，最后给出答案。"},
-            {"role": "user", "content": f"请一步一步解答这道题，最后一个字给出答案：{problem}"},
+            {"role": "user", "content": prompt_str},
         ]
         text = chat(llm, msgs, sampling, think=True)
         got = extract_final_number(strip_think(text))
         if answers_match(got, expected):
-            yield (f"请一步一步解答这道题，最后一个字给出答案：{problem}", text, True,
+            SEEN_PROMPTS.add(dedup_key(prompt_str))
+            yield (prompt_str, text, True,
                    {"source": "seed", "expected": expected})
             made += 1
     # 2) Teacher-invented problems (self-consistency verification).
@@ -485,6 +506,9 @@ def gen_code(llm, sampling, n: int, rng: random.Random):
     for task, tests, source in hf_tasks:
         if made >= n:
             return
+        prompt_str = f"写出满足要求的 Python 代码：\n{task}"
+        if dedup_key(prompt_str) in SEEN_PROMPTS:
+            continue
         msgs = [
             {"role": "system", "content": "你是一位 Python 程序员。只输出代码，不要解释。"},
             {"role": "user", "content": f"写出满足要求的 Python 代码，只给代码块：\n{task}"},
@@ -498,7 +522,8 @@ def gen_code(llm, sampling, n: int, rng: random.Random):
             ]
             expl = strip_think(chat(llm, explain_msgs, sampling, think=False))
             response = f"```python\n{code}\n```\n\n{expl}"
-            yield (f"写出满足要求的 Python 代码：\n{task}", response, True, {"source": source})
+            SEEN_PROMPTS.add(dedup_key(prompt_str))
+            yield (prompt_str, response, True, {"source": source})
             made += 1
     # 1) Built-in tasks.
     tasks = list(CODE_TASKS)
@@ -506,6 +531,9 @@ def gen_code(llm, sampling, n: int, rng: random.Random):
     for task, tests in tasks:
         if made >= n:
             return
+        prompt_str = f"写出满足要求的 Python 代码：\n{task}"
+        if dedup_key(prompt_str) in SEEN_PROMPTS:
+            continue
         msgs = [
             {"role": "system", "content": "你是一位 Python 程序员。只输出代码，不要解释。"},
             {"role": "user", "content": f"写出满足要求的 Python 代码，只给代码块：\n{task}"},
@@ -1119,11 +1147,12 @@ GENERATORS = {
 # ---------------------------------------------------------------------------
 
 def load_existing(path: Path):
-    """Return (records, per-category counts) already in the output file."""
+    """Return `(counts, seen_responses, seen_prompts)` already in the output file."""
     counts = {c: 0 for c in CATEGORIES}
     seen = set()
+    seen_prompts = set()
     if not path.exists():
-        return counts, seen
+        return counts, seen, seen_prompts
     with open(path, encoding="utf-8") as f:
         for line in f:
             try:
@@ -1132,7 +1161,9 @@ def load_existing(path: Path):
                 continue
             counts[rec.get("category", "")] = counts.get(rec.get("category", ""), 0) + 1
             seen.add(dedup_key(rec.get("response", "")))
-    return counts, seen
+            if rec.get("prompt"):
+                seen_prompts.add(dedup_key(rec["prompt"]))
+    return counts, seen, seen_prompts
 
 
 def main(argv=None) -> int:
@@ -1169,7 +1200,9 @@ def main(argv=None) -> int:
         counts = {c: min(counts[c], args.limit) for c in counts}
 
     out_path = Path(args.out)
-    existing, seen = load_existing(out_path)
+    existing, seen, seen_prompts = load_existing(out_path)
+    SEEN_PROMPTS.clear()
+    SEEN_PROMPTS.update(seen_prompts)
     rng = random.Random(args.seed)
 
     # HF question banks (loaded before the teacher starts; the
@@ -1181,6 +1214,11 @@ def main(argv=None) -> int:
     if args.code_source != "synthetic":
         parts = []
         if "humaneval" in args.code_source:
+            print(
+                "WARNING: HumanEval only has a test split; including it in training "
+                "contaminates HumanEval benchmarking.",
+                flush=True,
+            )
             print("loading HumanEval questions...", flush=True)
             parts.extend(load_humaneval_questions())
         if "mbpp" in args.code_source:

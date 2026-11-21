@@ -764,9 +764,13 @@ fn cmd_dump(args: &[String]) -> ExitCode {
                     x1[i] += ffn[i];
                 }
                 x = x1;
+                let (qn, _) = quantize_activations_sym_i8(&xn);
                 let (qo, _) = quantize_activations_sym_i8(&o_delta);
                 let (qx, _) = quantize_activations_sym_i8(&xn2);
-                let lines: [(&str, String); 11] = [
+                let (qh, _) = quantize_activations_sym_i8(&hidden);
+                let lines: [(&str, String); 14] = [
+                    ("SN", fmt_vec(&xn)),
+                    ("QN", fmt_ints(&qn)),
                     ("SP", fmt_vec(&o)),
                     ("QO", fmt_ints(&qo)),
                     ("SX", fmt_vec(&xn2)),
@@ -778,6 +782,7 @@ fn cmd_dump(args: &[String]) -> ExitCode {
                     ("FG", fmt_vec(&gate_out)),
                     ("FU", fmt_vec(&up_out)),
                     ("FH", fmt_vec(&hidden)),
+                    ("QH", fmt_ints(&qh)),
                 ];
                 for (tag, body) in lines {
                     if writeln!(out, "{tag} pos={t} block={idx} {body}").is_err() {
@@ -793,8 +798,15 @@ fn cmd_dump(args: &[String]) -> ExitCode {
             }
             let mem = &model.mem[m];
             let xn = mem.norm1.forward(&x);
+            let (mq, _) = quantize_activations_sym_i8(&xn);
             let a = mem.attn.forward(&xn, &mut state.rings[m]);
             if writeln!(out, "X pos={t} macro={m} {}", fmt_vec(&x)).is_err() {
+                return ExitCode::from(1);
+            }
+            if writeln!(out, "MN pos={t} macro={m} {}", fmt_vec(&xn)).is_err() {
+                return ExitCode::from(1);
+            }
+            if writeln!(out, "MQ pos={t} macro={m} {}", fmt_ints(&mq)).is_err() {
                 return ExitCode::from(1);
             }
             if writeln!(out, "A pos={t} macro={m} {}", fmt_vec(&a)).is_err() {
@@ -819,6 +831,13 @@ fn cmd_dump(args: &[String]) -> ExitCode {
                 y[i] = x[i] + g * a[i] + (1.0 - g) * mvec[i];
             }
             let xn2 = mem.norm2.forward(&y);
+            let (mx, _) = quantize_activations_sym_i8(&xn2);
+            if writeln!(out, "MY pos={t} macro={m} {}", fmt_vec(&xn2)).is_err() {
+                return ExitCode::from(1);
+            }
+            if writeln!(out, "MX pos={t} macro={m} {}", fmt_ints(&mx)).is_err() {
+                return ExitCode::from(1);
+            }
             let ffn = mem.ffn.forward(&xn2);
             for i in 0..d {
                 y[i] += ffn[i];
