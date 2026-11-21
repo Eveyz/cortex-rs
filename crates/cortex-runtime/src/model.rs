@@ -661,7 +661,7 @@ impl CortexModel {
                 ),
             ));
         }
-        for (m, w) in self.mem.iter().zip(weights.into_iter()) {
+        for (m, w) in self.mem.iter().zip(weights) {
             m.hip.replace_weights(w);
         }
         Ok(())
