@@ -169,10 +169,21 @@ def train(args) -> int:
         )
 
     model = CortexModelTorch(cfg).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    # Resume: restore model + optimizer + step, so the LR schedule and the
+    # epoch loop continue where the last run stopped instead of restarting.
+    # (Previously only the model weights were restored, so a resume re-ran
+    # warmup and the full epoch count — useless for a multi-day Colab run.)
+    start_step = 0
     if args.init_from:
         state = torch.load(args.init_from, map_location=device)
         model.load_state_dict(state["model"] if "model" in state else state)
-        print(f"resumed from {args.init_from}", flush=True)
+        print(f"resumed model from {args.init_from}", flush=True)
+        if "optimizer" in state:
+            opt.load_state_dict(state["optimizer"])
+            print("resumed optimizer state", flush=True)
+        start_step = int(state.get("step", 0))
+        print(f"resumed at step {start_step}", flush=True)
 
     train_set, eval_set = load_dataset(
         Path(args.data),
@@ -185,7 +196,6 @@ def train(args) -> int:
         print("no training examples", file=sys.stderr)
         return 2
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     steps_per_epoch = max(1, len(train_set) // max(1, args.batch_size * args.grad_accum))
     total_steps = max(1, steps_per_epoch * args.epochs)
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
@@ -194,20 +204,47 @@ def train(args) -> int:
         f"({steps_per_epoch}/epoch x {args.epochs}), warmup {warmup_steps}",
         flush=True,
     )
+    if start_step >= total_steps:
+        print(f"already at step {start_step}/{total_steps}; nothing to train", flush=True)
+        return 0
 
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_ckpt(path: Path) -> None:
+        # Write to a temp file then rename, so a session killed mid-write
+        # (Colab's 12h/24h cap) never leaves a corrupt checkpoint behind.
+        tmp = path.with_name(path.name + ".tmp")
+        torch.save(
+            {"model": model.state_dict(), "optimizer": opt.state_dict(), "step": step},
+            tmp,
+        )
+        tmp.replace(path)
+
     rng = random.Random(args.seed + 1)
-    step = 0
+    step = start_step
     micro = 0
     t0 = time.time()
     tokens_seen = 0
     model.train()
     done = False
-    for epoch in range(args.epochs):
+    # Skip the already-trained part: whole epochs, then micro-batches into
+    # the current epoch. (The resumed epoch is reshuffled — harmless.)
+    start_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
+    skip_micro = (start_step % steps_per_epoch) * args.grad_accum if start_step > 0 else 0
+    if start_step > 0:
+        print(
+            f"skipping to epoch {start_epoch}, {skip_micro} micro-batches into it",
+            flush=True,
+        )
+    last_ckpt = time.time()
+    for epoch in range(start_epoch, args.epochs):
         if done:
             break
         for batch in batches(train_set, args.batch_size, rng):
+            if skip_micro > 0:
+                skip_micro -= 1
+                continue
             ids, labels = collate(batch)
             ids, labels = ids.to(device), labels.to(device)
             logits = model(ids[:, :-1], training=True)
@@ -248,22 +285,26 @@ def train(args) -> int:
                         f"{generate_sample(model, p, 64, device)[:200]}",
                         flush=True,
                     )
-                torch.save(
-                    {"model": model.state_dict(), "optimizer": opt.state_dict(), "step": step},
-                    ckpt_dir / f"step-{step}.pt",
-                )
+                save_ckpt(ckpt_dir / f"step-{step}.pt")
+                save_ckpt(ckpt_dir / "latest.pt")
+                last_ckpt = time.time()
                 if args.export_every:
                     export_to_ctxb(model, ckpt_dir / f"step-{step}.ctxb")
+            # Time-based checkpoint: a Colab session can be killed at any
+            # moment (12h free / 24h Pro cap), so never go longer than
+            # --ckpt-every-min without a resume point on disk.
+            if args.ckpt_every_min and time.time() - last_ckpt >= args.ckpt_every_min * 60:
+                save_ckpt(ckpt_dir / "latest.pt")
+                last_ckpt = time.time()
+                print(f"--- checkpoint step {step} -> latest.pt", flush=True)
             if step >= total_steps:
                 done = True
                 break
 
     ev = eval_loss(model, eval_set, args.batch_size, device)
     print(f"final eval loss: {ev:.4f}", flush=True)
-    torch.save(
-        {"model": model.state_dict(), "optimizer": opt.state_dict(), "step": step},
-        ckpt_dir / "final.pt",
-    )
+    save_ckpt(ckpt_dir / "final.pt")
+    save_ckpt(ckpt_dir / "latest.pt")
     out = export_to_ctxb(model, args.out)
     print(f"exported {out} ({out.stat().st_size} bytes)")
     return 0
@@ -326,7 +367,16 @@ def main(argv=None) -> int:
     ap.add_argument("--config", choices=["micro", "production"], default="production")
     ap.add_argument("--out", default="student.ctxb")
     ap.add_argument("--ckpt-dir", default="ckpts")
-    ap.add_argument("--init-from", default=None, help="resume from a .pt checkpoint")
+    ap.add_argument(
+        "--init-from", default=None,
+        help="resume from a .pt checkpoint (restores model + optimizer + step; "
+        "use <ckpt-dir>/latest.pt to continue after a killed Colab session)",
+    )
+    ap.add_argument(
+        "--ckpt-every-min", type=float, default=30,
+        help="save <ckpt-dir>/latest.pt at least this often (minutes); "
+        "0 disables the timer (eval checkpoints still save latest.pt)",
+    )
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--seq-len", type=int, default=512)
